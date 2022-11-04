@@ -24,6 +24,8 @@ import (
 	compose "github.com/compose-spec/compose-go/types"
 )
 
+// Load is used only for unit testing.
+// TODO: Remove
 func Load(fileName, projectName string, envMap map[string]string) (*compose.Project, error) {
 	if envMap == nil {
 		envMap = make(map[string]string)

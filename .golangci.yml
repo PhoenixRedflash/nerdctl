@@ -5,7 +5,6 @@ run:
 linters:
   disable-all: true
   enable:
-    - deadcode
     - depguard
     - gofmt
     - goimports
@@ -14,9 +13,7 @@ linters:
     - misspell
     - nakedret
     - prealloc
-    - structcheck
     - typecheck
-    - varcheck
     # - asciicheck
     # - bodyclose
     # - dogsled
@@ -44,7 +41,7 @@ linters:
     # - gomodguard
     # - goprintffuncname
     # - gosec (gas)
-    # - gosimple (megacheck)
+    - gosimple # (megacheck)
     # - interfacer
     # - lll
     # - maligned
@@ -55,13 +52,13 @@ linters:
     # - rowserrcheck
     # - scopelint
     # - sqlclosecheck
-    # - staticcheck
-    # - stylecheck
+    - staticcheck
+    - stylecheck
     # - testpackage
     # - tparallel
     # - unconvert
     # - unparam
-    # - unused
+    - unused
     # - whitespace
     # - wrapcheck
     # - wsl

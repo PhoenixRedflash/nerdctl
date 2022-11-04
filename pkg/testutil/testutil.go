@@ -23,15 +23,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/containerd/nerdctl/pkg/buildkitutil"
+	"github.com/containerd/nerdctl/pkg/infoutil"
 	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
 	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
 	"github.com/containerd/nerdctl/pkg/platformutil"
+	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/opencontainers/go-digest"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
@@ -78,6 +81,34 @@ func (b *Base) ComposeCmd(args ...string) *Cmd {
 		binaryArgs = append(b.Args, append([]string{"compose"}, args...)...)
 	}
 	icmdCmd := icmd.Command(binary, binaryArgs...)
+	icmdCmd.Env = b.Env
+	cmd := &Cmd{
+		Cmd:  icmdCmd,
+		Base: b,
+	}
+	return cmd
+}
+
+func (b *Base) ComposeCmdWithHelper(helper []string, args ...string) *Cmd {
+	helperBin, err := exec.LookPath(helper[0])
+	if err != nil {
+		b.T.Skipf("helper binary %q not found", helper[0])
+	}
+	helperArgs := helper[1:]
+	var (
+		binary     string
+		binaryArgs []string
+	)
+	if b.ComposeBinary != "" {
+		binary = b.ComposeBinary
+		binaryArgs = append(b.Args, args...)
+	} else {
+		binary = b.Binary
+		binaryArgs = append(b.Args, append([]string{"compose"}, args...)...)
+	}
+	helperArgs = append(helperArgs, binary)
+	helperArgs = append(helperArgs, binaryArgs...)
+	icmdCmd := icmd.Command(helperBin, helperArgs...)
 	icmdCmd.Env = b.Env
 	cmd := &Cmd{
 		Cmd:  icmdCmd,
@@ -221,8 +252,10 @@ func (b *Base) InspectNetwork(name string) dockercompat.Network {
 	return dc[0]
 }
 
-func (b *Base) InspectVolume(name string) native.Volume {
-	cmdResult := b.Cmd("volume", "inspect", name).Run()
+func (b *Base) InspectVolume(name string, args ...string) native.Volume {
+	cmd := append([]string{"volume", "inspect"}, args...)
+	cmd = append(cmd, name)
+	cmdResult := b.Cmd(cmd...).Run()
 	assert.Equal(b.T, cmdResult.ExitCode, 0)
 	var dc []native.Volume
 	if err := json.Unmarshal([]byte(cmdResult.Stdout()), &dc); err != nil {
@@ -254,6 +287,23 @@ func (b *Base) InfoNative() native.Info {
 		b.T.Fatal(err)
 	}
 	return info
+}
+func (b *Base) EnsureContainerStarted(con string) {
+	b.T.Helper()
+
+	const (
+		maxRetry = 5
+		sleep    = time.Second
+	)
+	for i := 0; i < maxRetry; i++ {
+		if b.InspectContainer(con).State.Running {
+			b.T.Logf("container %s is now running", con)
+			return
+		}
+		b.T.Logf("(retry=%d)", i+1)
+		time.Sleep(sleep)
+	}
+	b.T.Fatalf("conainer %s not running", con)
 }
 
 type Cmd struct {
@@ -312,7 +362,7 @@ func (c *Cmd) AssertCombinedOutContains(s string) {
 func (c *Cmd) AssertOutNotContains(s string) {
 	c.AssertOutWithFunc(func(stdout string) error {
 		if strings.Contains(stdout, s) {
-			return fmt.Errorf("expected stdout to contain %q", s)
+			return fmt.Errorf("expected stdout to not contain %q", s)
 		} else {
 			return nil
 		}
@@ -436,6 +486,21 @@ func RequireDaemonVersion(b *Base, constraint string) {
 	}
 }
 
+func RequireKernelVersion(t testing.TB, constraint string) {
+	t.Helper()
+	c, err := semver.NewConstraint(constraint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unameR, err := semver.NewVersion(infoutil.UnameR())
+	if err != nil {
+		t.Skip(err)
+	}
+	if !c.Check(unameR) {
+		t.Skipf("version %v does not satisfy constraints %v", unameR, c)
+	}
+}
+
 func RequireContainerdPlugin(base *Base, requiredType, requiredID string, requiredCaps []string) {
 	base.T.Helper()
 	info := base.InfoNative()
@@ -461,6 +526,22 @@ func RequireContainerdPlugin(base *Base, requiredType, requiredID string, requir
 		base.T.Skipf("test requires containerd plugin \"%s.%s\"", requiredType, requiredID)
 	} else {
 		base.T.Skipf("test requires containerd plugin \"%s.%s\" with capabilities %v", requiredType, requiredID, requiredCaps)
+	}
+}
+
+func RequireSystemService(t testing.TB, sv string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("Service %q is not supported on %q", sv, runtime.GOOS)
+	}
+	var systemctlArgs []string
+	if rootlessutil.IsRootless() {
+		systemctlArgs = append(systemctlArgs, "--user")
+	}
+	systemctlArgs = append(systemctlArgs, []string{"-q", "is-active", sv}...)
+	cmd := exec.Command("systemctl", systemctlArgs...)
+	if err := cmd.Run(); err != nil {
+		t.Skipf("Service %q does not seem active: %v: %v", sv, cmd.Args, err)
 	}
 }
 

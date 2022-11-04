@@ -28,6 +28,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/console"
@@ -49,10 +50,10 @@ import (
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/platformutil"
 	"github.com/containerd/nerdctl/pkg/referenceutil"
+	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/containerd/nerdctl/pkg/strutil"
 	"github.com/containerd/nerdctl/pkg/taskutil"
-
-	"github.com/docker/cli/opts"
+	dopts "github.com/docker/cli/opts"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -108,6 +109,8 @@ func setCreateFlags(cmd *cobra.Command) {
 	cmd.RegisterFlagCompletionFunc("pull", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return []string{"always", "missing", "never"}, cobra.ShellCompDirectiveNoFileComp
 	})
+	cmd.Flags().String("stop-signal", "SIGTERM", "Signal to stop a container")
+	cmd.Flags().Int("stop-timeout", 0, "Timeout (in seconds) to stop a container")
 
 	// #region for init process
 	cmd.Flags().Bool("init", false, "Run an init process inside the container, Default to use tini")
@@ -121,7 +124,7 @@ func setCreateFlags(cmd *cobra.Command) {
 
 	// #region network flags
 	// network (net) is defined as StringSlice, not StringArray, to allow specifying "--network=cni1,cni2"
-	cmd.Flags().StringSlice("network", []string{netutil.DefaultNetworkName}, `Connect a container to a network ("bridge"|"host"|"none"|<CNI>)`)
+	cmd.Flags().StringSlice("network", []string{netutil.DefaultNetworkName}, `Connect a container to a network ("bridge"|"host"|"none"|"container:<container>"|<CNI>)`)
 	cmd.RegisterFlagCompletionFunc("network", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return shellCompleteNetworkNames(cmd, []string{})
 	})
@@ -131,16 +134,31 @@ func setCreateFlags(cmd *cobra.Command) {
 	})
 	// dns is defined as StringSlice, not StringArray, to allow specifying "--dns=1.1.1.1,8.8.8.8" (compatible with Podman)
 	cmd.Flags().StringSlice("dns", nil, "Set custom DNS servers")
+	cmd.Flags().StringSlice("dns-search", nil, "Set custom DNS search domains")
+	// We allow for both "--dns-opt" and "--dns-option", although the latter is the recommended way.
+	cmd.Flags().StringSlice("dns-opt", nil, "Set DNS options")
+	cmd.Flags().StringSlice("dns-option", nil, "Set DNS options")
 	// publish is defined as StringSlice, not StringArray, to allow specifying "--publish=80:80,443:443" (compatible with Podman)
 	cmd.Flags().StringSliceP("publish", "p", nil, "Publish a container's port(s) to the host")
 	// FIXME: not support IPV6 yet
 	cmd.Flags().String("ip", "", "IPv4 address to assign to the container")
 	cmd.Flags().StringP("hostname", "h", "", "Container host name")
+	cmd.Flags().String("mac-address", "", "MAC address to assign to the container")
 	// #endregion
 
+	cmd.Flags().String("ipc", "", `IPC namespace to use ("host"|"private")`)
+	cmd.RegisterFlagCompletionFunc("ipc", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"host", "private"}, cobra.ShellCompDirectiveNoFileComp
+	})
 	// #region cgroups, namespaces, and ulimits flags
 	cmd.Flags().Float64("cpus", 0.0, "Number of CPUs")
 	cmd.Flags().StringP("memory", "m", "", "Memory limit")
+	cmd.Flags().String("memory-reservation", "", "Memory soft limit")
+	cmd.Flags().String("memory-swap", "", "Swap limit equal to memory plus swap: '-1' to enable unlimited swap")
+	cmd.Flags().Int64("memory-swappiness", -1, "Tune container memory swappiness (0 to 100) (default -1)")
+	cmd.Flags().String("kernel-memory", "", "Kernel memory limit (deprecated)")
+	cmd.Flags().Bool("oom-kill-disable", false, "Disable OOM Killer")
+	cmd.Flags().Int("oom-score-adj", 0, "Tune container’s OOM preferences (-1000 to 1000)")
 	cmd.Flags().String("pid", "", "PID namespace to use")
 	cmd.RegisterFlagCompletionFunc("pid", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return []string{"host"}, cobra.ShellCompDirectiveNoFileComp
@@ -166,11 +184,13 @@ func setCreateFlags(cmd *cobra.Command) {
 
 	// user flags
 	cmd.Flags().StringP("user", "u", "", "Username or UID (format: <name|uid>[:<group|gid>])")
+	cmd.Flags().String("umask", "", "Set the umask inside the container. Defaults to 0022")
+	cmd.Flags().StringSlice("group-add", []string{}, "Add additional groups to join")
 
 	// #region security flags
 	cmd.Flags().StringArray("security-opt", []string{}, "Security options")
 	cmd.RegisterFlagCompletionFunc("security-opt", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		return []string{"seccomp=", "seccomp=unconfined", "apparmor=", "apparmor=" + defaults.AppArmorProfileName, "apparmor=unconfined", "no-new-privileges"}, cobra.ShellCompDirectiveNoFileComp
+		return []string{"seccomp=", "seccomp=unconfined", "apparmor=", "apparmor=" + defaults.AppArmorProfileName, "apparmor=unconfined", "no-new-privileges", "privileged-without-host-devices"}, cobra.ShellCompDirectiveNoFileComp
 	})
 	// cap-add and cap-drop are defined as StringSlice, not StringArray, to allow specifying "--cap-add=CAP_SYS_ADMIN,CAP_NET_ADMIN" (compatible with Podman)
 	cmd.Flags().StringSlice("cap-add", []string{}, "Add Linux capabilities")
@@ -205,7 +225,10 @@ func setCreateFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("rootfs", false, "The first argument is not an image but the rootfs to the exploded container")
 
 	// #region env flags
-	cmd.Flags().String("entrypoint", "", "Overwrite the default ENTRYPOINT of the image")
+	// entrypoint needs to be StringArray, not StringSlice, to prevent "FOO=foo1,foo2" from being split to {"FOO=foo1", "foo2"}
+	// entrypoint StringArray is an internal implementation to support `nerdctl compose` entrypoint yaml filed with multiple strings
+	// users are not expected to specify multiple --entrypoint flags manually.
+	cmd.Flags().StringArray("entrypoint", nil, "Overwrite the default ENTRYPOINT of the image")
 	cmd.Flags().StringP("workdir", "w", "", "Working directory inside the container")
 	// env needs to be StringArray, not StringSlice, to prevent "FOO=foo1,foo2" from being split to {"FOO=foo1", "foo2"}
 	cmd.Flags().StringArrayP("env", "e", nil, "Set environment variables")
@@ -229,7 +252,10 @@ func setCreateFlags(cmd *cobra.Command) {
 
 	// #region logging flags
 	// log-opt needs to be StringArray, not StringSlice, to prevent "env=os,customer" from being split to {"env=os", "customer"}
-	cmd.Flags().String("log-driver", "json-file", "Logging driver for the container")
+	cmd.Flags().String("log-driver", "json-file", "Logging driver for the container. Default is json-file. It also supports logURI (eg: --log-driver binary://<path>)")
+	cmd.RegisterFlagCompletionFunc("log-driver", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return logging.Drivers(), cobra.ShellCompDirectiveNoFileComp
+	})
 	cmd.Flags().StringArray("log-opt", nil, "Log driver options")
 	// #endregion
 
@@ -248,8 +274,6 @@ func setCreateFlags(cmd *cobra.Command) {
 
 // runAction is heavily based on ctr implementation:
 // https://github.com/containerd/containerd/blob/v1.4.3/cmd/ctr/commands/run/run.go
-//
-// FIXME: split to smaller functions
 func runAction(cmd *cobra.Command, args []string) error {
 	platform, err := cmd.Flags().GetString("platform")
 	if err != nil {
@@ -273,16 +297,13 @@ func runAction(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	container, dataStore, containerNameStore, err := createContainer(cmd, ctx, client, args, platform, flagI, flagT, flagD)
+	container, gc, err := createContainer(cmd, ctx, client, args, platform, flagI, flagT, flagD)
 	if err != nil {
+		if gc != nil {
+			defer gc()
+		}
 		return err
 	}
-
-	lab, err := container.Labels(ctx)
-	if err != nil {
-		return err
-	}
-	logURI := lab[labels.LogURI]
 
 	id := container.ID()
 	rm, err := cmd.Flags().GetBool("rm")
@@ -294,11 +315,8 @@ func runAction(cmd *cobra.Command, args []string) error {
 			return errors.New("flag -d and --rm cannot be specified together")
 		}
 		defer func() {
-			const removeAnonVolumes = true
-			ns := lab[labels.Namespace]
-			stateDir := lab[labels.StateDir]
-			if removeErr := removeContainer(cmd, ctx, container, ns, id, true, dataStore, stateDir, containerNameStore, removeAnonVolumes); removeErr != nil {
-				logrus.WithError(removeErr).Warnf("failed to remove container %s", id)
+			if err := removeContainer(cmd, ctx, container, true, true); err != nil {
+				logrus.WithError(err).Warnf("failed to remove container %s", id)
 			}
 		}()
 	}
@@ -311,6 +329,12 @@ func runAction(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
+
+	lab, err := container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	logURI := lab[labels.LogURI]
 
 	task, err := taskutil.NewTask(ctx, client, container, flagI, flagT, flagD, con, logURI)
 	if err != nil {
@@ -360,7 +384,8 @@ func runAction(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd.Client, args []string, platform string, flagI, flagT, flagD bool) (containerd.Container, string, namestore.NameStore, error) {
+// FIXME: split to smaller functions
+func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd.Client, args []string, platform string, flagI, flagT, flagD bool) (containerd.Container, func(), error) {
 	// simulate the behavior of double dash
 	newArg := []string{}
 	if len(args) >= 2 && args[1] == "--" {
@@ -371,7 +396,7 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 
 	ns, err := cmd.Flags().GetString("namespace")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 
 	var (
@@ -382,46 +407,46 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 
 	cidfile, err := cmd.Flags().GetString("cidfile")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if cidfile != "" {
 		if err := writeCIDFile(cidfile, id); err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 	}
 
 	dataStore, err := getDataStore(cmd)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 
 	stateDir, err := getContainerStateDirPath(cmd, dataStore, id)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 
 	opts = append(opts,
 		oci.WithDefaultSpec(),
 	)
 
-	opts, err = setPlatformOptions(opts, cmd, id)
+	opts, err = setPlatformOptions(ctx, opts, cmd, client, id)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 
 	rootfsOpts, rootfsCOpts, ensuredImage, err := generateRootfsOpts(ctx, client, platform, cmd, args, id)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	opts = append(opts, rootfsOpts...)
 	cOpts = append(cOpts, rootfsCOpts...)
 
 	wd, err := cmd.Flags().GetString("workdir")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if wd != "" {
 		opts = append(opts, oci.WithProcessCwd(wd))
@@ -429,19 +454,19 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 
 	envFile, err := cmd.Flags().GetStringSlice("env-file")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if envFiles := strutil.DedupeStrSlice(envFile); len(envFiles) > 0 {
 		env, err := parseEnvVars(envFiles)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 		opts = append(opts, oci.WithEnv(env))
 	}
 
 	env, err := cmd.Flags().GetStringArray("env")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if env := strutil.DedupeStrSlice(env); len(env) > 0 {
 		opts = append(opts, oci.WithEnv(env))
@@ -449,20 +474,20 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 
 	if flagI {
 		if flagD {
-			return nil, "", nil, errors.New("currently flag -i and -d cannot be specified together (FIXME)")
+			return nil, nil, errors.New("currently flag -i and -d cannot be specified together (FIXME)")
 		}
 	}
 
 	if flagT {
 		if flagD {
-			return nil, "", nil, errors.New("currently flag -t and -d cannot be specified together (FIXME)")
+			return nil, nil, errors.New("currently flag -t and -d cannot be specified together (FIXME)")
 		}
 		opts = append(opts, oci.WithTTY)
 	}
 
 	mountOpts, anonVolumes, mountPoints, err := generateMountOpts(cmd, ctx, client, ensuredImage)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	} else {
 		opts = append(opts, mountOpts...)
 	}
@@ -472,39 +497,70 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 		// json-file is the built-in and default log driver for nerdctl
 		logDriver, err := cmd.Flags().GetString("log-driver")
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
-		logOptMap, err := parseKVStringsMapFromLogOpt(cmd, logDriver)
-		if err != nil {
-			return nil, "", nil, err
-		}
-		if lu, err := generateLogURI(dataStore, logDriver, logOptMap); err != nil {
-			return nil, "", nil, err
-		} else if lu != nil {
-			logURI = lu.String()
+
+		// check if log driver is a valid uri. If it is a valid uri and scheme is not
+		if u, err := url.Parse(logDriver); err == nil && u.Scheme != "" {
+			logURI = logDriver
+		} else {
+			logOptMap, err := parseKVStringsMapFromLogOpt(cmd, logDriver)
+			if err != nil {
+				return nil, nil, err
+			}
+			logDriverInst, err := logging.GetDriver(logDriver, logOptMap)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := logDriverInst.Init(dataStore, ns, id); err != nil {
+				return nil, nil, err
+			}
+			logConfig := &logging.LogConfig{
+				Driver: logDriver,
+				Opts:   logOptMap,
+			}
+			logConfigB, err := json.Marshal(logConfig)
+			if err != nil {
+				return nil, nil, err
+			}
+			logConfigFilePath := logging.LogConfigFilePath(dataStore, ns, id)
+			if err = os.WriteFile(logConfigFilePath, logConfigB, 0600); err != nil {
+				return nil, nil, err
+			}
+			if lu, err := generateLogURI(dataStore); err != nil {
+				return nil, nil, err
+			} else if lu != nil {
+				logrus.Debugf("generated log driver: %s", lu.String())
+
+				logURI = lu.String()
+			}
 		}
 	}
 
 	restartValue, err := cmd.Flags().GetString("restart")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	restartOpts, err := generateRestartOpts(ctx, client, restartValue, logURI)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	cOpts = append(cOpts, restartOpts...)
 
-	netOpts, netSlice, ipAddress, ports, err := generateNetOpts(cmd, dataStore, stateDir, ns, id)
+	stopSignal, err := cmd.Flags().GetString("stop-signal")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
-	opts = append(opts, netOpts...)
+	stopTimeout, err := cmd.Flags().GetInt("stop-timeout")
+	if err != nil {
+		return nil, nil, err
+	}
+	cOpts = append(cOpts, withStop(stopSignal, stopTimeout, ensuredImage))
 
 	hostname := id[0:12]
 	customHostname, err := cmd.Flags().GetString("hostname")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if customHostname != "" {
 		hostname = customHostname
@@ -514,39 +570,57 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 	if runtime.GOOS == "linux" {
 		hostnamePath := filepath.Join(stateDir, "hostname")
 		if err := os.WriteFile(hostnamePath, []byte(hostname+"\n"), 0644); err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 		opts = append(opts, withCustomEtcHostname(hostnamePath))
 	}
 
-	hookOpt, err := withNerdctlOCIHook(cmd, id, stateDir)
+	netOpts, netSlice, ipAddress, ports, macAddress, err := generateNetOpts(cmd, dataStore, stateDir, ns, id)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
+	}
+	opts = append(opts, netOpts...)
+
+	hookOpt, err := withNerdctlOCIHook(cmd, id)
+	if err != nil {
+		return nil, nil, err
 	}
 	opts = append(opts, hookOpt)
 
 	if uOpts, err := generateUserOpts(cmd); err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	} else {
 		opts = append(opts, uOpts...)
 	}
 
+	if gOpts, err := generateGroupsOpts(cmd); err != nil {
+		return nil, nil, err
+	} else {
+		opts = append(opts, gOpts...)
+	}
+
+	if umaskOpts, err := generateUmaskOpts(cmd); err != nil {
+		return nil, nil, err
+	} else {
+		opts = append(opts, umaskOpts...)
+	}
+
 	rtCOpts, err := generateRuntimeCOpts(cmd)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	cOpts = append(cOpts, rtCOpts...)
 
 	lCOpts, err := withContainerLabels(cmd)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	cOpts = append(cOpts, lCOpts...)
 
 	var containerNameStore namestore.NameStore
 	name, err := cmd.Flags().GetString("name")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	if name == "" && !cmd.Flags().Changed("name") {
 		// Automatically set the container name, unless `--name=""` was explicitly specified.
@@ -559,10 +633,10 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 	if name != "" {
 		containerNameStore, err = namestore.New(dataStore, ns)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 		if err := containerNameStore.Acquire(name, id); err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -570,18 +644,23 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 	if cmd.Flags().Lookup("pidfile").Changed {
 		pidFile, err = cmd.Flags().GetString("pidfile")
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 	}
 
 	extraHosts, err := cmd.Flags().GetStringSlice("add-host")
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	extraHosts = strutil.DedupeStrSlice(extraHosts)
-	ilOpt, err := withInternalLabels(ns, name, hostname, stateDir, extraHosts, netSlice, ipAddress, ports, logURI, anonVolumes, pidFile, platform, mountPoints)
+	for _, host := range extraHosts {
+		if _, err := dopts.ValidateExtraHost(host); err != nil {
+			return nil, nil, err
+		}
+	}
+	ilOpt, err := withInternalLabels(ns, name, hostname, stateDir, extraHosts, netSlice, ipAddress, ports, logURI, anonVolumes, pidFile, platform, mountPoints, macAddress)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, nil, err
 	}
 	cOpts = append(cOpts, ilOpt)
 
@@ -591,12 +670,35 @@ func createContainer(cmd *cobra.Command, ctx context.Context, client *containerd
 	spec := containerd.WithSpec(&s, opts...)
 	cOpts = append(cOpts, spec)
 
-	logrus.Debugf("final cOpts is %v", cOpts)
+	cOpts, err = setPlatformContainerOptions(ctx, cOpts, cmd, client, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	container, err := client.NewContainer(ctx, id, cOpts...)
 	if err != nil {
-		return nil, "", nil, err
+		gcContainer := func() {
+			var isErr bool
+			if errE := os.RemoveAll(stateDir); errE != nil {
+				isErr = true
+			}
+			if name != "" {
+				var errE error
+				if containerNameStore, errE = namestore.New(dataStore, ns); errE != nil {
+					isErr = true
+				}
+				if errE = containerNameStore.Release(name, id); errE != nil {
+					isErr = true
+				}
+
+			}
+			if isErr {
+				logrus.Warnf("failed to remove container %q", id)
+			}
+		}
+		return nil, gcContainer, err
 	}
-	return container, dataStore, containerNameStore, nil
+	return container, nil, nil
 }
 
 func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform string, cmd *cobra.Command, args []string, id string) ([]oci.SpecOpts, []containerd.NewContainerOpts, *imgutil.EnsuredImage, error) {
@@ -660,7 +762,7 @@ func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform
 	}
 
 	// NOTE: "--entrypoint" can be set to an empty string, see TestRunEntrypoint* in run_test.go .
-	entrypoint, err := cmd.Flags().GetString("entrypoint")
+	entrypoint, err := cmd.Flags().GetStringArray("entrypoint")
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -672,8 +774,8 @@ func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform
 			opts = append(opts, oci.WithImageConfig(ensured.Image))
 		}
 		var processArgs []string
-		if entrypoint != "" {
-			processArgs = append(processArgs, entrypoint)
+		if len(entrypoint) != 0 {
+			processArgs = append(processArgs, entrypoint...)
 		}
 		if len(args) > 1 {
 			processArgs = append(processArgs, args[1:]...)
@@ -697,7 +799,6 @@ func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform
 		initProcessFlag = true
 	}
 	if initProcessFlag {
-		binaryNameInContainer := ""
 		binaryPath, err := exec.LookPath(initBinary)
 		if err != nil {
 			if errors.Is(err, exec.ErrNotFound) {
@@ -705,11 +806,11 @@ func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform
 			}
 			return nil, nil, nil, err
 		}
-		binaryNameInContainer = filepath.Join("/sbin", filepath.Base(initBinary))
+		inContainerPath := filepath.Join("/sbin", filepath.Base(initBinary))
 		opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, spec *oci.Spec) error {
-			spec.Process.Args = append([]string{binaryNameInContainer, "--"}, spec.Process.Args...)
+			spec.Process.Args = append([]string{inContainerPath, "--"}, spec.Process.Args...)
 			spec.Mounts = append([]specs.Mount{{
-				Destination: binaryNameInContainer,
+				Destination: inContainerPath,
 				Type:        "bind",
 				Source:      binaryPath,
 				Options:     []string{"bind", "ro"},
@@ -726,6 +827,32 @@ func generateRootfsOpts(ctx context.Context, client *containerd.Client, platform
 		opts = append(opts, oci.WithRootFSReadonly())
 	}
 	return opts, cOpts, ensured, nil
+}
+
+// withBindMountHostIPC replaces /dev/shm and /dev/mqueue  mount with rbind.
+// Required for --ipc=host on rootless.
+func withBindMountHostIPC(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+	for i, m := range s.Mounts {
+		if path.Clean(m.Destination) == "/dev/shm" {
+			newM := specs.Mount{
+				Destination: "/dev/shm",
+				Type:        "bind",
+				Source:      "/dev/shm",
+				Options:     []string{"rbind", "nosuid", "noexec", "nodev"},
+			}
+			s.Mounts[i] = newM
+		}
+		if path.Clean(m.Destination) == "/dev/mqueue" {
+			newM := specs.Mount{
+				Destination: "/dev/mqueue",
+				Type:        "bind",
+				Source:      "/dev/mqueue",
+				Options:     []string{"rbind", "nosuid", "noexec", "nodev"},
+			}
+			s.Mounts[i] = newM
+		}
+	}
+	return nil
 }
 
 // withBindMountHostProcfs replaces procfs mount with rbind.
@@ -758,22 +885,13 @@ func withBindMountHostProcfs(_ context.Context, _ oci.Client, _ *containers.Cont
 	return nil
 }
 
-func generateLogURI(dataStore, logDriver string, logOptMap map[string]string) (*url.URL, error) {
-	var selfExe string
-	if logDriver == "json-file" {
-		var err error
-		selfExe, err = os.Executable()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		return nil, fmt.Errorf("%s is not yet supported", logDriver)
+func generateLogURI(dataStore string) (*url.URL, error) {
+	selfExe, err := os.Executable()
+	if err != nil {
+		return nil, err
 	}
 	args := map[string]string{
 		logging.MagicArgv1: dataStore,
-	}
-	for k, v := range logOptMap {
-		args[k] = v
 	}
 	if runtime.GOOS == "windows" {
 		return nil, nil
@@ -782,7 +900,7 @@ func generateLogURI(dataStore, logDriver string, logOptMap map[string]string) (*
 	return cio.LogURIGenerator("binary", selfExe, args)
 }
 
-func withNerdctlOCIHook(cmd *cobra.Command, id, stateDir string) (oci.SpecOpts, error) {
+func withNerdctlOCIHook(cmd *cobra.Command, id string) (oci.SpecOpts, error) {
 	selfExe, f := globalFlags(cmd)
 	args := append([]string{selfExe}, append(f, "internal", "oci-hook")...)
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
@@ -840,7 +958,7 @@ func readKVStringsMapfFromLabel(cmd *cobra.Command) (map[string]string, error) {
 		return nil, err
 	}
 	labelsFilePath = strutil.DedupeStrSlice(labelsFilePath)
-	labels, err := opts.ReadKVStrings(labelsFilePath, labelsMap)
+	labels, err := dopts.ReadKVStrings(labelsFilePath, labelsMap)
 	if err != nil {
 		return nil, err
 	}
@@ -861,10 +979,33 @@ func parseKVStringsMapFromLogOpt(cmd *cobra.Command, logDriver string) (map[stri
 			delete(logOptMap, logging.MaxFile)
 		}
 	}
+	if err := logging.ValidateLogOpts(logDriver, logOptMap); err != nil {
+		return nil, err
+	}
 	return logOptMap, nil
 }
 
-func withInternalLabels(ns, name, hostname, containerStateDir string, extraHosts, networks []string, ipAddress string, ports []gocni.PortMapping, logURI string, anonVolumes []string, pidFile, platform string, mountPoints []*mountutil.Processed) (containerd.NewContainerOpts, error) {
+func withStop(stopSignal string, stopTimeout int, ensuredImage *imgutil.EnsuredImage) containerd.NewContainerOpts {
+	return func(ctx context.Context, _ *containerd.Client, c *containers.Container) error {
+		if c.Labels == nil {
+			c.Labels = make(map[string]string)
+		}
+		var err error
+		if ensuredImage != nil {
+			stopSignal, err = containerd.GetOCIStopSignal(ctx, ensuredImage.Image, stopSignal)
+			if err != nil {
+				return err
+			}
+		}
+		c.Labels[containerd.StopSignalLabel] = stopSignal
+		if stopTimeout != 0 {
+			c.Labels[labels.StopTimout] = strconv.Itoa(stopTimeout)
+		}
+		return nil
+	}
+}
+
+func withInternalLabels(ns, name, hostname, containerStateDir string, extraHosts, networks []string, ipAddress string, ports []gocni.PortMapping, logURI string, anonVolumes []string, pidFile, platform string, mountPoints []*mountutil.Processed, macAddress string) (containerd.NewContainerOpts, error) {
 	m := make(map[string]string)
 	m[labels.Namespace] = ns
 	if name != "" {
@@ -922,6 +1063,10 @@ func withInternalLabels(ns, name, hostname, containerStateDir string, extraHosts
 		m[labels.Mounts] = string(mountPointsJSON)
 	}
 
+	if macAddress != "" {
+		m[labels.MACAddress] = macAddress
+	}
+
 	return containerd.WithAdditionalContainerLabels(m), nil
 }
 
@@ -962,6 +1107,9 @@ func writeCIDFile(path, id string) error {
 		return fmt.Errorf("container ID file found, make sure the other container isn't running or delete %s", path)
 	} else if errors.Is(err, os.ErrNotExist) {
 		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
 		defer f.Close()
 		if err != nil {
 			return fmt.Errorf("failed to create the container ID file: %s", err)
@@ -998,4 +1146,47 @@ func parseEnvVars(paths []string) ([]string, error) {
 		}
 	}
 	return vars, nil
+}
+
+func generateSharingPIDOpts(ctx context.Context, targetCon containerd.Container) ([]oci.SpecOpts, error) {
+	opts := make([]oci.SpecOpts, 0)
+
+	task, err := targetCon.Task(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	status, err := task.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if status.Status != containerd.Running {
+		return nil, fmt.Errorf("shared container is not running")
+	}
+
+	spec, err := targetCon.Spec(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	isHost := true
+	for _, n := range spec.Linux.Namespaces {
+		if n.Type == specs.PIDNamespace {
+			isHost = false
+		}
+	}
+	if isHost {
+		opts = append(opts, oci.WithHostNamespace(specs.PIDNamespace))
+		if rootlessutil.IsRootless() {
+			opts = append(opts, withBindMountHostProcfs)
+		}
+	} else {
+		ns := specs.LinuxNamespace{
+			Type: specs.PIDNamespace,
+			Path: fmt.Sprintf("/proc/%d/ns/pid", task.Pid()),
+		}
+		opts = append(opts, oci.WithLinuxNamespace(ns))
+	}
+
+	return opts, nil
 }

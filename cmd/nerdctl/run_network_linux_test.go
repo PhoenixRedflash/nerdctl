@@ -21,9 +21,11 @@ import (
 	"io"
 	"net"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/containerd/nerdctl/pkg/testutil"
 	"github.com/containerd/nerdctl/pkg/testutil/nettestutil"
@@ -191,7 +193,7 @@ func TestRunPortWithNoHostPort(t *testing.T) {
 			result = portCmd.Run()
 			stdoutContent = result.Stdout() + result.Stderr()
 			assert.Assert(cmd.Base.T, result.ExitCode == 0, stdoutContent)
-			regexExpression := regexp.MustCompile("80\\/tcp.*?->.*?0.0.0.0:(?P<portNumber>\\d{1,5}).*?")
+			regexExpression := regexp.MustCompile(`80\/tcp.*?->.*?0.0.0.0:(?P<portNumber>\d{1,5}).*?`)
 			match := regexExpression.FindStringSubmatch(stdoutContent)
 			paramsMap := make(map[string]string)
 			for i, name := range regexExpression.SubexpNames() {
@@ -396,6 +398,17 @@ func TestRunPort(t *testing.T) {
 
 }
 
+func TestRunWithInvalidPortThenCleanUp(t *testing.T) {
+	// docker does not set label restriction to 4096 bytes
+	testutil.DockerIncompatible(t)
+	t.Parallel()
+	base := testutil.NewBase(t)
+	containerName := testutil.Identifier(t)
+	base.Cmd("run", "--rm", "--name", containerName, "-p", "22200-22299:22200-22299", testutil.CommonImage).AssertFail()
+	base.Cmd("run", "--rm", "--name", containerName, "-p", "22200-22299:22200-22299", testutil.CommonImage).AssertCombinedOutContains(errdefs.ErrInvalidArgument.Error())
+	base.Cmd("run", "--rm", "--name", containerName, testutil.CommonImage).AssertOK()
+}
+
 func TestRunContainerWithStaticIP(t *testing.T) {
 	if rootlessutil.IsRootless() {
 		t.Skip("Static IP assignment is not supported rootless mode yet.")
@@ -410,25 +423,25 @@ func TestRunContainerWithStaticIP(t *testing.T) {
 		ip                string
 		shouldSuccess     bool
 		useNetwork        bool
-		checkTheIpAddress bool
+		checkTheIPAddress bool
 	}{
 		{
 			ip:                "172.0.0.2",
 			shouldSuccess:     true,
 			useNetwork:        true,
-			checkTheIpAddress: true,
+			checkTheIPAddress: true,
 		},
 		{
 			ip:                "192.0.0.2",
 			shouldSuccess:     false,
 			useNetwork:        true,
-			checkTheIpAddress: false,
+			checkTheIPAddress: false,
 		},
 		{
 			ip:                "10.4.0.2",
 			shouldSuccess:     true,
 			useNetwork:        false,
-			checkTheIpAddress: false,
+			checkTheIPAddress: false,
 		},
 	}
 	tID := testutil.Identifier(t)
@@ -454,7 +467,7 @@ func TestRunContainerWithStaticIP(t *testing.T) {
 			} else {
 				cmd.AssertOK()
 			}
-			if tc.checkTheIpAddress {
+			if tc.checkTheIPAddress {
 				inspectCmd := base.Cmd("inspect", testContainerName, "--format", "\"{{range .NetworkSettings.Networks}} {{.IPAddress}}{{end}}\"")
 				result := inspectCmd.Run()
 				stdoutContent := result.Stdout() + result.Stderr()
@@ -465,5 +478,100 @@ func TestRunContainerWithStaticIP(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunDNS(t *testing.T) {
+	base := testutil.NewBase(t)
+
+	base.Cmd("run", "--rm", "--dns", "8.8.8.8", testutil.CommonImage,
+		"cat", "/etc/resolv.conf").AssertOutContains("nameserver 8.8.8.8\n")
+	base.Cmd("run", "--rm", "--dns-search", "test", testutil.CommonImage,
+		"cat", "/etc/resolv.conf").AssertOutContains("search test\n")
+	base.Cmd("run", "--rm", "--dns-search", "test", "--dns-search", "test1", testutil.CommonImage,
+		"cat", "/etc/resolv.conf").AssertOutContains("search test test1\n")
+	base.Cmd("run", "--rm", "--dns-opt", "no-tld-query", "--dns-option", "attempts:10", testutil.CommonImage,
+		"cat", "/etc/resolv.conf").AssertOutContains("options no-tld-query attempts:10\n")
+	cmd := base.Cmd("run", "--rm", "--dns", "8.8.8.8", "--dns-search", "test", "--dns-option", "attempts:10", testutil.CommonImage,
+		"cat", "/etc/resolv.conf")
+	cmd.AssertOutContains("nameserver 8.8.8.8\n")
+	cmd.AssertOutContains("search test\n")
+	cmd.AssertOutContains("options attempts:10\n")
+}
+
+func TestSharedNetworkStack(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("--network=container:<container name|id> only supports linux now")
+	}
+	base := testutil.NewBase(t)
+
+	containerName := testutil.Identifier(t)
+	defer base.Cmd("rm", "-f", containerName).AssertOK()
+	base.Cmd("run", "-d", "--name", containerName,
+		testutil.NginxAlpineImage).AssertOK()
+	base.EnsureContainerStarted(containerName)
+
+	containerNameJoin := testutil.Identifier(t) + "-network"
+	defer base.Cmd("rm", "-f", containerNameJoin).AssertOK()
+	base.Cmd("run",
+		"-d",
+		"--name", containerNameJoin,
+		"--network=container:"+containerName,
+		testutil.CommonImage,
+		"sleep", "infinity").AssertOK()
+
+	base.Cmd("exec", containerNameJoin, "wget", "-qO-", "http://127.0.0.1:80").
+		AssertOutContains(testutil.NginxAlpineIndexHTMLSnippet)
+
+	base.Cmd("restart", containerName).AssertOK()
+	base.Cmd("stop", "--time=1", containerNameJoin).AssertOK()
+	base.Cmd("start", containerNameJoin).AssertOK()
+	base.Cmd("exec", containerNameJoin, "wget", "-qO-", "http://127.0.0.1:80").
+		AssertOutContains(testutil.NginxAlpineIndexHTMLSnippet)
+}
+
+func TestRunContainerWithMACAddress(t *testing.T) {
+	base := testutil.NewBase(t)
+	tID := testutil.Identifier(t)
+	networkBridge := "testNetworkBridge" + tID
+	networkMACvlan := "testNetworkMACvlan" + tID
+	networkIPvlan := "testNetworkIPvlan" + tID
+	base.Cmd("network", "create", networkBridge, "--driver", "bridge").AssertOK()
+	base.Cmd("network", "create", networkMACvlan, "--driver", "macvlan").AssertOK()
+	base.Cmd("network", "create", networkIPvlan, "--driver", "ipvlan").AssertOK()
+	t.Cleanup(func() {
+		base.Cmd("network", "rm", networkBridge).Run()
+		base.Cmd("network", "rm", networkMACvlan).Run()
+		base.Cmd("network", "rm", networkIPvlan).Run()
+	})
+	tests := []struct {
+		Network string
+		WantErr bool
+		Expect  string
+	}{
+		{"host", true, "conflicting options"},
+		{"none", true, "can't open '/sys/class/net/eth0/address'"},
+		{"container:whatever" + tID, true, "conflicting options"},
+		{"bridge", false, ""},
+		{networkBridge, false, ""},
+		{networkMACvlan, false, ""},
+		{networkIPvlan, true, "not support"},
+	}
+	for _, test := range tests {
+		macAddress, err := nettestutil.GenerateMACAddress()
+		if err != nil {
+			t.Errorf("failed to generate MAC address: %s", err)
+		}
+		if test.Expect == "" && !test.WantErr {
+			test.Expect = macAddress
+		}
+		cmd := base.Cmd("run", "--rm", "--network", test.Network, "--mac-address", macAddress, testutil.CommonImage, "cat", "/sys/class/net/eth0/address")
+		if test.WantErr {
+			cmd.AssertFail()
+			cmd.AssertCombinedOutContains(test.Expect)
+		} else {
+			cmd.AssertOK()
+			cmd.AssertOutContains(test.Expect)
+		}
 	}
 }

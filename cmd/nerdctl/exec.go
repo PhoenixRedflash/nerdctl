@@ -82,7 +82,7 @@ func execAction(cmd *cobra.Command, args []string) error {
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
 			if found.MatchCount > 1 {
-				return fmt.Errorf("ambiguous ID %q", found.Req)
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
 			}
 			return execActionWithContainer(ctx, cmd, args, found.Container, client)
 		},
@@ -254,9 +254,7 @@ func generateExecProcessSpec(ctx context.Context, cmd *cobra.Command, args []str
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range strutil.DedupeStrSlice(env) {
-		pspec.Env = append(pspec.Env, e)
-	}
+	pspec.Env = append(pspec.Env, strutil.DedupeStrSlice(env)...)
 
 	privileged, err := cmd.Flags().GetBool("privileged")
 	if err != nil {

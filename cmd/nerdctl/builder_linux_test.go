@@ -16,4 +16,27 @@
 
 package main
 
-func removeBridgeNetworkInterface(name string) {}
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/containerd/nerdctl/pkg/testutil"
+	"gotest.tools/v3/assert"
+)
+
+func TestBuilderDebug(t *testing.T) {
+	testutil.DockerIncompatible(t)
+	base := testutil.NewBase(t)
+
+	dockerfile := fmt.Sprintf(`FROM %s
+CMD ["echo", "nerdctl-builder-debug-test-string"]
+	`, testutil.CommonImage)
+
+	buildCtx, err := createBuildContext(dockerfile)
+	assert.NilError(t, err)
+	defer os.RemoveAll(buildCtx)
+
+	base.Cmd("builder", "debug", buildCtx).CmdOption(testutil.WithStdin(bytes.NewReader([]byte("c\n")))).AssertOK()
+}

@@ -25,7 +25,7 @@ import (
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/nerdctl/pkg/idgen"
 	"github.com/containerd/nerdctl/pkg/mountutil/volumestore"
 	"github.com/containerd/nerdctl/pkg/strutil"
@@ -56,6 +56,7 @@ func ProcessFlagV(s string, volStore volumestore.VolumeStore) (*Processed, error
 		options  []string
 	)
 
+	s = strings.TrimLeft(s, ":")
 	split := strings.Split(s, ":")
 	switch len(split) {
 	case 1:
@@ -74,7 +75,7 @@ func ProcessFlagV(s string, volStore volumestore.VolumeStore) (*Processed, error
 		if !strings.Contains(src, "/") {
 			// assume src is a volume name
 			res.Name = src
-			vol, err := volStore.Get(src)
+			vol, err := volStore.Get(src, false)
 			if err != nil {
 				if errors.Is(err, errdefs.ErrNotFound) {
 					vol, err = volStore.Create(src, nil)
@@ -121,7 +122,20 @@ func ProcessFlagV(s string, volStore volumestore.VolumeStore) (*Processed, error
 	fstype := "nullfs"
 	if runtime.GOOS != "freebsd" {
 		fstype = "none"
-		options = append(options, "rbind")
+		found := false
+		for _, opt := range options {
+			switch opt {
+			case "rbind", "bind":
+				fstype = "bind"
+				found = true
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			options = append(options, "rbind")
+		}
 	}
 	res.Mount = specs.Mount{
 		Type:        fstype,
@@ -129,7 +143,7 @@ func ProcessFlagV(s string, volStore volumestore.VolumeStore) (*Processed, error
 		Destination: dst,
 		Options:     options,
 	}
-	if sys.RunningInUserNS() {
+	if userns.RunningInUserNS() {
 		unpriv, err := getUnprivilegedMountFlags(src)
 		if err != nil {
 			return nil, err

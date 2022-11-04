@@ -43,10 +43,8 @@ func shellCompleteNamespaceNames(cmd *cobra.Command, args []string, toComplete s
 		logrus.Warn(err)
 		return nil, cobra.ShellCompDirectiveError
 	}
-	candidates := []string{}
-	for _, ns := range nsList {
-		candidates = append(candidates, ns)
-	}
+	var candidates []string
+	candidates = append(candidates, nsList...)
 	return candidates, cobra.ShellCompDirectiveNoFileComp
 }
 
@@ -64,9 +62,7 @@ func shellCompleteSnapshotterNames(cmd *cobra.Command, args []string, toComplete
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
-	candidates := []string{}
-	for _, name := range snapshotterPlugins {
-		candidates = append(candidates, name)
-	}
+	var candidates []string
+	candidates = append(candidates, snapshotterPlugins...)
 	return candidates, cobra.ShellCompDirectiveNoFileComp
 }

@@ -62,8 +62,8 @@ type VolumeStore interface {
 	Dir() string
 	Create(name string, labels []string) (*native.Volume, error)
 	// Get may return ErrNotFound
-	Get(name string) (*native.Volume, error)
-	List() (map[string]native.Volume, error)
+	Get(name string, size bool) (*native.Volume, error)
+	List(size bool) (map[string]native.Volume, error)
 	Remove(names []string) (removedNames []string, err error)
 }
 
@@ -101,13 +101,13 @@ func (vs *volumeStore) Create(name string, labels []string) (*native.Volume, err
 			Labels: labelsMap,
 		}
 
-		labelsJson, err := json.MarshalIndent(volOpts, "", "    ")
+		labelsJSON, err := json.MarshalIndent(volOpts, "", "    ")
 		if err != nil {
 			return err
 		}
 
 		volFilePath := filepath.Join(volPath, volumeJSONFileName)
-		if err := os.WriteFile(volFilePath, labelsJson, 0644); err != nil {
+		if err := os.WriteFile(volFilePath, labelsJSON, 0644); err != nil {
 			return err
 		}
 		return nil
@@ -124,7 +124,7 @@ func (vs *volumeStore) Create(name string, labels []string) (*native.Volume, err
 	return vol, nil
 }
 
-func (vs *volumeStore) Get(name string) (*native.Volume, error) {
+func (vs *volumeStore) Get(name string, size bool) (*native.Volume, error) {
 	if err := identifiers.Validate(name); err != nil {
 		return nil, fmt.Errorf("malformed name %s: %w", name, err)
 	}
@@ -151,10 +151,16 @@ func (vs *volumeStore) Get(name string) (*native.Volume, error) {
 		Mountpoint: dataPath,
 		Labels:     Labels(volumeDataBytes),
 	}
+	if size {
+		entry.Size, err = Size(&entry)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &entry, nil
 }
 
-func (vs *volumeStore) List() (map[string]native.Volume, error) {
+func (vs *volumeStore) List(size bool) (map[string]native.Volume, error) {
 	dEnts, err := os.ReadDir(vs.dir)
 	if err != nil {
 		return nil, err
@@ -163,7 +169,7 @@ func (vs *volumeStore) List() (map[string]native.Volume, error) {
 	res := make(map[string]native.Volume, len(dEnts))
 	for _, dEnt := range dEnts {
 		name := dEnt.Name()
-		vol, err := vs.Get(name)
+		vol, err := vs.Get(name, size)
 		if err != nil {
 			return res, err
 		}
@@ -200,4 +206,22 @@ func Labels(b []byte) *map[string]string {
 		return nil
 	}
 	return vo.Labels
+}
+
+func Size(volume *native.Volume) (int64, error) {
+	var size int64 = 0
+	var walkFn = func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	}
+	var err = filepath.Walk(volume.Mountpoint, walkFn)
+	if err != nil {
+		return 0, err
+	}
+	return size, nil
 }

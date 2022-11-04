@@ -182,8 +182,8 @@ func NewAuthCreds(refHostname string) (AuthCreds, error) {
 	authConfigHostnames := []string{refHostname}
 	if refHostname == "docker.io" || refHostname == "registry-1.docker.io" {
 		// "docker.io" appears as ""https://index.docker.io/v1/" in ~/.docker/config.json .
-		// GetAuthConfig takes the hostname part as the argument: "index.docker.io"
-		authConfigHostnames = append([]string{"index.docker.io"}, refHostname)
+		// Unlike other registries, we have to pass the full URL to GetAuthConfig.
+		authConfigHostnames = append([]string{IndexServer}, refHostname)
 	}
 
 	for _, authConfigHostname := range authConfigHostnames {
@@ -196,13 +196,17 @@ func NewAuthCreds(refHostname string) (AuthCreds, error) {
 			// When refHostname is "docker.io":
 			// - credFuncExpectedHostname: "registry-1.docker.io"
 			// - credFuncArg:              "registry-1.docker.io"
-			// - authConfigHostname:       "index.docker.io"
+			// - authConfigHostname:       "https://index.docker.io/v1/" (IndexServer)
 			// - ac.ServerAddress:         "https://index.docker.io/v1/".
 			if !isAuthConfigEmpty(ac) {
 				if ac.ServerAddress == "" {
 					// This can happen with Amazon ECR: https://github.com/containerd/nerdctl/issues/733
 					logrus.Debugf("failed to get ac.ServerAddress for authConfigHostname=%q (refHostname=%q)",
 						authConfigHostname, refHostname)
+				} else if authConfigHostname == IndexServer {
+					if ac.ServerAddress != IndexServer {
+						return nil, fmt.Errorf("expected ac.ServerAddress (%q) to be %q", ac.ServerAddress, IndexServer)
+					}
 				} else {
 					acsaHostname := credentials.ConvertToHostname(ac.ServerAddress)
 					if acsaHostname != authConfigHostname {

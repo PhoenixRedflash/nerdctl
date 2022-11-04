@@ -36,7 +36,6 @@ import (
 	"github.com/containerd/nerdctl/pkg/netutil/nettype"
 	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	types100 "github.com/containernetworking/cni/pkg/types/100"
-	dopts "github.com/docker/cli/opts"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	b4nndclient "github.com/rootless-containers/bypass4netns/pkg/api/daemon/client"
@@ -100,31 +99,11 @@ func newHandlerOpts(state *specs.State, dataStore, cniPath, cniNetconfPath strin
 		dataStore: dataStore,
 	}
 
-	extraHostsJSON := o.state.Annotations[labels.ExtraHosts]
-	var extraHosts []string
-	if err := json.Unmarshal([]byte(extraHostsJSON), &extraHosts); err != nil {
+	extraHosts, err := getExtraHosts(state)
+	if err != nil {
 		return nil, err
 	}
-
-	//validate and format extraHosts
-	ensureExtraHosts := func(extraHosts []string) (map[string]string, error) {
-		hosts := make(map[string]string)
-		for _, host := range extraHosts {
-			hostIP, err := dopts.ValidateExtraHost(host)
-			if err != nil {
-				return nil, err
-			}
-			if v := strings.SplitN(hostIP, ":", 2); len(v) == 2 {
-				hosts[v[1]] = v[0]
-			}
-		}
-		return hosts, nil
-	}
-
-	var err error
-	if o.extraHosts, err = ensureExtraHosts(extraHosts); err != nil {
-		return nil, err
-	}
+	o.extraHosts = extraHosts
 
 	hs, err := loadSpec(o.state.Bundle)
 	if err != nil {
@@ -156,7 +135,7 @@ func newHandlerOpts(state *specs.State, dataStore, cniPath, cniNetconfPath strin
 	}
 
 	switch netType {
-	case nettype.Host, nettype.None:
+	case nettype.Host, nettype.None, nettype.Container:
 		// NOP
 	case nettype.CNI:
 		e, err := netutil.NewCNIEnv(cniPath, cniNetconfPath)
@@ -199,6 +178,10 @@ func newHandlerOpts(state *specs.State, dataStore, cniPath, cniNetconfPath strin
 		o.containerIP = ipAddress
 	}
 
+	if macAddress, ok := o.state.Annotations[labels.MACAddress]; ok {
+		o.contianerMAC = macAddress
+	}
+
 	if rootlessutil.IsRootlessChild() {
 		o.rootlessKitClient, err = rootlessutil.NewRootlessKitClient()
 		if err != nil {
@@ -232,8 +215,9 @@ type handlerOpts struct {
 	fullID            string
 	rootlessKitClient rlkclient.Client
 	bypassClient      b4nndclient.Client
-	extraHosts        map[string]string // ip:host
+	extraHosts        map[string]string // host:ip
 	containerIP       string
+	contianerMAC      string
 }
 
 // hookSpec is from https://github.com/containerd/containerd/blob/v1.4.3/cmd/containerd/command/oci-hook.go#L59-L64
@@ -257,6 +241,22 @@ func loadSpec(bundle string) (*hookSpec, error) {
 	return &s, nil
 }
 
+func getExtraHosts(state *specs.State) (map[string]string, error) {
+	extraHostsJSON := state.Annotations[labels.ExtraHosts]
+	var extraHosts []string
+	if err := json.Unmarshal([]byte(extraHostsJSON), &extraHosts); err != nil {
+		return nil, err
+	}
+
+	hosts := make(map[string]string)
+	for _, host := range extraHosts {
+		if v := strings.SplitN(host, ":", 2); len(v) == 2 {
+			hosts[v[0]] = v[1]
+		}
+	}
+	return hosts, nil
+}
+
 func getNetNSPath(state *specs.State) (string, error) {
 	// If we have a network-namespace annotation we use it over the passed Pid.
 	netNsPath, netNsFound := state.Annotations[NetworkNamespace]
@@ -269,7 +269,7 @@ func getNetNSPath(state *specs.State) (string, error) {
 	}
 
 	if state.Pid == 0 && !netNsFound {
-		return "", errors.New("Both state.Pid and the netNs annotation are unset")
+		return "", errors.New("both state.Pid and the netNs annotation are unset")
 	}
 
 	// We dont't have a networking namespace annotation, but we have a PID.
@@ -345,6 +345,20 @@ func getIPAddressOpts(opts *handlerOpts) ([]gocni.NamespaceOpts, error) {
 	return nil, nil
 }
 
+func getMACAddressOpts(opts *handlerOpts) ([]gocni.NamespaceOpts, error) {
+	if opts.contianerMAC != "" {
+		return []gocni.NamespaceOpts{
+			gocni.WithLabels(map[string]string{
+				// allow loose CNI argument verification
+				// FYI: https://github.com/containernetworking/cni/issues/560
+				"IgnoreUnknown": "1",
+			}),
+			gocni.WithArgs("MAC", opts.contianerMAC),
+		}, nil
+	}
+	return nil, nil
+}
+
 func onCreateRuntime(opts *handlerOpts) error {
 	loadAppArmor()
 
@@ -366,9 +380,14 @@ func onCreateRuntime(opts *handlerOpts) error {
 		if err != nil {
 			return err
 		}
+		macAddressOpts, err := getMACAddressOpts(opts)
+		if err != nil {
+			return err
+		}
 		var namespaceOpts []gocni.NamespaceOpts
 		namespaceOpts = append(namespaceOpts, portMapOpts...)
 		namespaceOpts = append(namespaceOpts, ipAddressOpts...)
+		namespaceOpts = append(namespaceOpts, macAddressOpts...)
 		hsMeta := hostsstore.Meta{
 			Namespace:  opts.state.Annotations[labels.Namespace],
 			ID:         opts.state.ID,
@@ -397,7 +416,7 @@ func onCreateRuntime(opts *handlerOpts) error {
 
 		if rootlessutil.IsRootlessChild() {
 			if b4nnEnabled {
-				bm, err := bypass4netnsutil.NewBypass4netnsCNIBypassManager(opts.bypassClient)
+				bm, err := bypass4netnsutil.NewBypass4netnsCNIBypassManager(opts.bypassClient, opts.rootlessKitClient)
 				if err != nil {
 					return err
 				}
@@ -431,7 +450,7 @@ func onPostStop(opts *handlerOpts) error {
 		}
 		if rootlessutil.IsRootlessChild() {
 			if b4nnEnabled {
-				bm, err := bypass4netnsutil.NewBypass4netnsCNIBypassManager(opts.bypassClient)
+				bm, err := bypass4netnsutil.NewBypass4netnsCNIBypassManager(opts.bypassClient, opts.rootlessKitClient)
 				if err != nil {
 					return err
 				}
@@ -459,9 +478,14 @@ func onPostStop(opts *handlerOpts) error {
 		if err != nil {
 			return err
 		}
+		macAddressOpts, err := getMACAddressOpts(opts)
+		if err != nil {
+			return err
+		}
 		var namespaceOpts []gocni.NamespaceOpts
 		namespaceOpts = append(namespaceOpts, portMapOpts...)
 		namespaceOpts = append(namespaceOpts, ipAddressOpts...)
+		namespaceOpts = append(namespaceOpts, macAddressOpts...)
 		if err := opts.cni.Remove(ctx, opts.fullID, "", namespaceOpts...); err != nil {
 			logrus.WithError(err).Errorf("failed to call cni.Remove")
 			return err

@@ -54,7 +54,7 @@ func newLoadCommand() *cobra.Command {
 	return loadCommand
 }
 
-func loadAction(cmd *cobra.Command, args []string) error {
+func loadAction(cmd *cobra.Command, _ []string) error {
 	in := cmd.InOrStdin()
 	input, err := cmd.Flags().GetString("input")
 	if err != nil {
@@ -67,8 +67,16 @@ func loadAction(cmd *cobra.Command, args []string) error {
 		}
 		defer f.Close()
 		in = f
+	} else {
+		// check if stdin is empty.
+		stdinStat, err := os.Stdin.Stat()
+		if err != nil {
+			return err
+		}
+		if stdinStat.Size() == 0 && (stdinStat.Mode()&os.ModeNamedPipe) == 0 {
+			return errors.New("stdin is empty and input flag is not specified")
+		}
 	}
-
 	decompressor, err := compression.DecompressStream(in)
 	if err != nil {
 		return err
@@ -87,10 +95,10 @@ func loadAction(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	return loadImage(decompressor, cmd, args, platMC, false)
+	return loadImage(decompressor, cmd, platMC, false)
 }
 
-func loadImage(in io.Reader, cmd *cobra.Command, args []string, platMC platforms.MatchComparer, quiet bool) error {
+func loadImage(in io.Reader, cmd *cobra.Command, platMC platforms.MatchComparer, quiet bool) error {
 	// In addition to passing WithImagePlatform() to client.Import(), we also need to pass WithDefaultPlatform() to newClient().
 	// Otherwise unpacking may fail.
 	client, ctx, cancel, err := newClient(cmd, containerd.WithDefaultPlatform(platMC))
@@ -115,7 +123,7 @@ func loadImage(in io.Reader, cmd *cobra.Command, args []string, platMC platforms
 
 		// TODO: Show unpack status
 		if !quiet {
-			fmt.Fprintf(cmd.OutOrStdout(), "unpacking %s (%s)...", img.Name, img.Target.Digest)
+			fmt.Fprintf(cmd.OutOrStdout(), "unpacking %s (%s)...\n", img.Name, img.Target.Digest)
 		}
 		err = image.Unpack(ctx, sn)
 		if err != nil {
@@ -124,7 +132,7 @@ func loadImage(in io.Reader, cmd *cobra.Command, args []string, platMC platforms
 		if quiet {
 			fmt.Fprintln(cmd.OutOrStdout(), img.Target.Digest)
 		} else {
-			fmt.Fprintf(cmd.OutOrStdout(), "done\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Loaded image: %s", img.Name)
 		}
 	}
 

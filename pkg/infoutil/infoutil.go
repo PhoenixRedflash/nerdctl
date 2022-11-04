@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"time"
@@ -28,9 +29,12 @@ import (
 	"github.com/containerd/containerd"
 	ptypes "github.com/containerd/containerd/protobuf/types"
 	"github.com/containerd/containerd/services/introspection"
+	"github.com/containerd/nerdctl/pkg/buildkitutil"
 	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
 	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
+	"github.com/containerd/nerdctl/pkg/logging"
 	"github.com/containerd/nerdctl/pkg/version"
+	"github.com/sirupsen/logrus"
 )
 
 func NativeDaemonInfo(ctx context.Context, client *containerd.Client) (*native.DaemonInfo, error) {
@@ -74,9 +78,9 @@ func Info(ctx context.Context, client *containerd.Client, snapshotter, cgroupMan
 
 	var info dockercompat.Info
 	info.ID = daemonIntro.UUID
-	// Storage Driver is not really Server concept for nerdctl, but mimics `docker info` output
+	// Storage drivers and logging drivers are not really Server concept for nerdctl, but mimics `docker info` output
 	info.Driver = snapshotter
-	info.Plugins.Log = []string{"json-file"}
+	info.Plugins.Log = logging.Drivers()
 	info.Plugins.Storage = snapshotterPlugins
 	info.SystemTime = time.Now().Format(time.RFC3339Nano)
 	info.LoggingDriver = "json-file" // hard-coded
@@ -116,6 +120,9 @@ func ClientVersion() dockercompat.ClientVersion {
 		GoVersion: runtime.Version(),
 		Os:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
+		Components: []dockercompat.ComponentVersion{
+			buildctlVersion(),
+		},
 	}
 }
 
@@ -132,8 +139,8 @@ func ServerVersion(ctx context.Context, client *containerd.Client) (*dockercompa
 				Version: daemonVersion.Version,
 				Details: map[string]string{"GitCommit": daemonVersion.Revision},
 			},
+			runcVersion(),
 		},
-		// TODO: add runc version
 	}
 	return v, nil
 }
@@ -148,4 +155,102 @@ func ServerSemVer(ctx context.Context, client *containerd.Client) (*semver.Versi
 		return nil, fmt.Errorf("failed to parse the containerd version %q: %w", v.Version, err)
 	}
 	return sv, nil
+}
+
+func buildctlVersion() dockercompat.ComponentVersion {
+	buildctlBinary, err := buildkitutil.BuildctlBinary()
+	if err != nil {
+		logrus.Warnf("unable to determine buildctl version: %s", err.Error())
+		return dockercompat.ComponentVersion{Name: "buildctl"}
+	}
+
+	stdout, err := exec.Command(buildctlBinary, "--version").Output()
+	if err != nil {
+		logrus.Warnf("unable to determine buildctl version: %s", err.Error())
+		return dockercompat.ComponentVersion{Name: "buildctl"}
+	}
+
+	v, err := parseBuildctlVersion(stdout)
+	if err != nil {
+		logrus.Warn(err)
+		return dockercompat.ComponentVersion{Name: "buildctl"}
+	}
+	return *v
+}
+
+func parseBuildctlVersion(buildctlVersionStdout []byte) (*dockercompat.ComponentVersion, error) {
+	fields := strings.Fields(strings.TrimSpace(string(buildctlVersionStdout)))
+	var v *dockercompat.ComponentVersion
+	switch len(fields) {
+	case 4:
+		v = &dockercompat.ComponentVersion{
+			Name:    fields[0],
+			Version: fields[2],
+			Details: map[string]string{"GitCommit": fields[3]},
+		}
+	case 3:
+		v = &dockercompat.ComponentVersion{
+			Name:    fields[0],
+			Version: fields[2],
+		}
+	default:
+		return nil, fmt.Errorf("unable to determine buildctl version, got %q", string(buildctlVersionStdout))
+	}
+	if v.Name != "buildctl" {
+		return nil, fmt.Errorf("unable to determine buildctl version, got %q", string(buildctlVersionStdout))
+	}
+	return v, nil
+}
+
+func runcVersion() dockercompat.ComponentVersion {
+	stdout, err := exec.Command("runc", "--version").Output()
+	if err != nil {
+		logrus.Warnf("unable to determine runc version: %s", err.Error())
+		return dockercompat.ComponentVersion{Name: "runc"}
+	}
+	v, err := parseRuncVersion(stdout)
+	if err != nil {
+		logrus.Warn(err)
+		return dockercompat.ComponentVersion{Name: "runc"}
+	}
+	return *v
+}
+
+func parseRuncVersion(runcVersionStdout []byte) (*dockercompat.ComponentVersion, error) {
+	var versionList = strings.Split(strings.TrimSpace(string(runcVersionStdout)), "\n")
+	firstLine := strings.Fields(versionList[0])
+	if len(firstLine) != 3 || firstLine[0] != "runc" {
+		return nil, fmt.Errorf("unable to determine runc version, got: %s", string(runcVersionStdout))
+	}
+	version := firstLine[2]
+
+	details := map[string]string{}
+	for _, detailsLine := range versionList[1:] {
+		detail := strings.SplitN(detailsLine, ":", 2)
+		if len(detail) != 2 {
+			logrus.Warnf("unable to determine one of runc details, got: %s, %d", detail, len(detail))
+			continue
+		}
+		switch strings.TrimSpace(detail[0]) {
+		case "commit":
+			details["GitCommit"] = strings.TrimSpace(detail[1])
+		}
+	}
+
+	return &dockercompat.ComponentVersion{
+		Name:    "runc",
+		Version: version,
+		Details: details,
+	}, nil
+}
+
+// BlockIOWeight return whether Block IO weight is supported or not
+func BlockIOWeight(cgroupManager string) bool {
+	var info *dockercompat.Info
+	info.CgroupVersion = CgroupsVersion()
+	info.CgroupDriver = cgroupManager
+	mobySysInfo := mobySysInfo(info)
+	// blkio weight is not available on cgroup v1 since kernel 5.0.
+	// On cgroup v2, blkio weight is implemented using io.weight
+	return mobySysInfo.BlkioWeight
 }

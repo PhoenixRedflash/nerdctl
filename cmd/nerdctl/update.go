@@ -29,20 +29,25 @@ import (
 	"github.com/containerd/containerd/pkg/cri/util"
 	"github.com/containerd/nerdctl/pkg/formatter"
 	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/pkg/infoutil"
 	"github.com/containerd/typeurl"
 	"github.com/docker/go-units"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
 type updateResourceOptions struct {
-	CpuPeriod          uint64
-	CpuQuota           int64
-	CpuShares          uint64
+	CPUPeriod          uint64
+	CPUQuota           int64
+	CPUShares          uint64
 	MemoryLimitInBytes int64
+	MemoryReservation  int64
+	MemorySwapInBytes  int64
 	CpusetCpus         string
 	CpusetMems         string
 	PidsLimit          int64
+	BlkioWeight        uint16
 }
 
 func newUpdateCommand() *cobra.Command {
@@ -66,9 +71,13 @@ func setUpdateFlags(cmd *cobra.Command) {
 	cmd.Flags().Int64("cpu-quota", -1, "Limit CPU CFS (Completely Fair Scheduler) quota")
 	cmd.Flags().Uint64("cpu-shares", 0, "CPU shares (relative weight)")
 	cmd.Flags().StringP("memory", "m", "", "Memory limit")
+	cmd.Flags().String("memory-reservation", "", "Memory soft limit")
+	cmd.Flags().String("memory-swap", "", "Swap limit equal to memory plus swap: '-1' to enable unlimited swap")
+	cmd.Flags().String("kernel-memory", "", "Kernel memory limit (deprecated)")
 	cmd.Flags().String("cpuset-cpus", "", "CPUs in which to allow execution (0-3, 0,1)")
 	cmd.Flags().String("cpuset-mems", "", "MEMs in which to allow execution (0-3, 0,1)")
 	cmd.Flags().Int64("pids-limit", -1, "Tune container pids limit (set -1 for unlimited)")
+	cmd.Flags().Uint16("blkio-weight", 0, "Block IO (relative weight), between 10 and 1000, or 0 to disable (default 0)")
 }
 
 func updateAction(cmd *cobra.Command, args []string) error {
@@ -84,6 +93,9 @@ func updateAction(cmd *cobra.Command, args []string) error {
 	walker := &containerwalker.ContainerWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
 			err = updateContainer(ctx, client, found.Container.ID(), options, cmd)
 			return err
 		},
@@ -94,8 +106,6 @@ func updateAction(cmd *cobra.Command, args []string) error {
 			return err
 		} else if n == 0 {
 			return fmt.Errorf("no such container %s", req)
-		} else if n > 1 {
-			return fmt.Errorf("multiple IDs found with provided prefix: %s", req)
 		}
 	}
 	return nil
@@ -132,12 +142,57 @@ func getUpdateOption(cmd *cobra.Command) (updateResourceOptions, error) {
 	if err != nil {
 		return options, err
 	}
+	memSwap, err := cmd.Flags().GetString("memory-swap")
+	if err != nil {
+		return options, err
+	}
 	var mem64 int64
 	if memStr != "" {
 		mem64, err = units.RAMInBytes(memStr)
 		if err != nil {
 			return options, fmt.Errorf("failed to parse memory bytes %q: %w", memStr, err)
 		}
+	}
+	var memSwap64 int64
+	if memSwap != "" {
+		if memSwap == "-1" {
+			memSwap64 = -1
+		} else {
+			memSwap64, err = units.RAMInBytes(memSwap)
+			if err != nil {
+				return options, fmt.Errorf("failed to parse memory-swap bytes %q: %w", memSwap, err)
+			}
+			if mem64 > 0 && memSwap64 > 0 && memSwap64 < mem64 {
+				return options, fmt.Errorf("minimum memoryswap limit should be larger than memory limit, see usage")
+			}
+		}
+	} else {
+		memSwap64 = mem64 * 2
+	}
+	if memSwap64 == 0 {
+		memSwap64 = mem64 * 2
+	}
+	memReserve, err := cmd.Flags().GetString("memory-reservation")
+	if err != nil {
+		return options, err
+	}
+	var memReserve64 int64
+	if memReserve != "" {
+		memReserve64, err = units.RAMInBytes(memReserve)
+		if err != nil {
+			return options, fmt.Errorf("failed to parse memory bytes %q: %w", memReserve, err)
+		}
+	}
+	if mem64 > 0 && memReserve64 > 0 && mem64 < memReserve64 {
+		return options, fmt.Errorf("minimum memory limit can not be less than memory reservation limit, see usage")
+	}
+
+	kernelMemStr, err := cmd.Flags().GetString("kernel-memory")
+	if err != nil {
+		return options, err
+	}
+	if kernelMemStr != "" && cmd.Flag("kernel-memory").Changed {
+		logrus.Warnf("The --kernel-memory flag is no longer supported. This flag is a noop.")
 	}
 	cpuset, err := cmd.Flags().GetString("cpuset-cpus")
 	if err != nil {
@@ -151,15 +206,33 @@ func getUpdateOption(cmd *cobra.Command) (updateResourceOptions, error) {
 	if err != nil {
 		return options, err
 	}
+	blkioWeight, err := cmd.Flags().GetUint16("blkio-weight")
+	if err != nil {
+		return options, err
+	}
+	cgroupManager, err := cmd.Flags().GetString("cgroup-manager")
+	if err != nil {
+		return options, err
+	}
+	if blkioWeight != 0 && !infoutil.BlockIOWeight(cgroupManager) {
+		return options, fmt.Errorf("kernel support for cgroup blkio weight missing, weight discarded")
+	}
+	if blkioWeight > 0 && blkioWeight < 10 || blkioWeight > 1000 {
+		return options, errors.New("range of blkio weight is from 10 to 1000")
+	}
+
 	if runtime.GOOS == "linux" {
 		options = updateResourceOptions{
-			CpuPeriod:          cpuPeriod,
-			CpuQuota:           cpuQuota,
-			CpuShares:          shares,
+			CPUPeriod:          cpuPeriod,
+			CPUQuota:           cpuQuota,
+			CPUShares:          shares,
 			CpusetCpus:         cpuset,
 			CpusetMems:         cpusetMems,
 			MemoryLimitInBytes: mem64,
+			MemoryReservation:  memReserve64,
+			MemorySwapInBytes:  memSwap64,
 			PidsLimit:          pidsLimit,
+			BlkioWeight:        blkioWeight,
 		}
 	}
 	return options, nil
@@ -190,22 +263,30 @@ func updateContainer(ctx context.Context, client *containerd.Client, id string, 
 		if spec.Linux.Resources == nil {
 			spec.Linux.Resources = &runtimespec.LinuxResources{}
 		}
+		if spec.Linux.Resources.BlockIO == nil {
+			spec.Linux.Resources.BlockIO = &runtimespec.LinuxBlockIO{}
+		}
+		if cmd.Flags().Changed("blkio-weight") {
+			if spec.Linux.Resources.BlockIO.Weight != &opts.BlkioWeight {
+				spec.Linux.Resources.BlockIO.Weight = &opts.BlkioWeight
+			}
+		}
 		if spec.Linux.Resources.CPU == nil {
 			spec.Linux.Resources.CPU = &runtimespec.LinuxCPU{}
 		}
 		if cmd.Flags().Changed("cpu-shares") {
-			if spec.Linux.Resources.CPU.Shares != &opts.CpuShares {
-				spec.Linux.Resources.CPU.Shares = &opts.CpuShares
+			if spec.Linux.Resources.CPU.Shares != &opts.CPUShares {
+				spec.Linux.Resources.CPU.Shares = &opts.CPUShares
 			}
 		}
 		if cmd.Flags().Changed("cpu-quota") {
-			if spec.Linux.Resources.CPU.Quota != &opts.CpuQuota {
-				spec.Linux.Resources.CPU.Quota = &opts.CpuQuota
+			if spec.Linux.Resources.CPU.Quota != &opts.CPUQuota {
+				spec.Linux.Resources.CPU.Quota = &opts.CPUQuota
 			}
 		}
 		if cmd.Flags().Changed("cpu-period") {
-			if spec.Linux.Resources.CPU.Period != &opts.CpuPeriod {
-				spec.Linux.Resources.CPU.Period = &opts.CpuPeriod
+			if spec.Linux.Resources.CPU.Period != &opts.CPUPeriod {
+				spec.Linux.Resources.CPU.Period = &opts.CPUPeriod
 			}
 		}
 		if cmd.Flags().Changed("cpus") {
@@ -230,6 +311,14 @@ func updateContainer(ctx context.Context, client *containerd.Client, id string, 
 		if cmd.Flags().Changed("memory") {
 			if spec.Linux.Resources.Memory.Limit != &opts.MemoryLimitInBytes {
 				spec.Linux.Resources.Memory.Limit = &opts.MemoryLimitInBytes
+			}
+			if spec.Linux.Resources.Memory.Swap != &opts.MemorySwapInBytes {
+				spec.Linux.Resources.Memory.Swap = &opts.MemorySwapInBytes
+			}
+		}
+		if cmd.Flags().Changed("memory-reservation") {
+			if spec.Linux.Resources.Memory.Reservation != &opts.MemoryReservation {
+				spec.Linux.Resources.Memory.Reservation = &opts.MemoryReservation
 			}
 		}
 		if spec.Linux.Resources.Pids == nil {

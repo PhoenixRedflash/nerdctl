@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/containerd"
@@ -42,26 +43,66 @@ const (
 	Management = "management"
 )
 
-// mainHelpTemplate was derived from https://github.com/spf13/cobra/blob/v1.2.1/command.go#L491-L514
-const mainHelpTemplate = `Usage:{{if .Runnable}}
-  {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
-  {{.CommandPath}} [command]{{end}}{{if gt (len .Aliases) 0}}
-Aliases:
-  {{.NameAndAliases}}{{end}}{{if .HasExample}}
-Examples:
-{{.Example}}{{end}}{{if .HasAvailableSubCommands}}
-Management commands:{{range .Commands}}{{if (eq (index .Annotations "category") "management")}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
-  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
-Commands:{{range .Commands}}{{if (eq (index .Annotations "category") "")}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
-  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
-Flags:
-{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
-Global Flags:
-{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
-Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
-  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
-Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
-`
+// usage was derived from https://github.com/spf13/cobra/blob/v1.2.1/command.go#L491-L514
+func usage(c *cobra.Command) error {
+	s := "Usage: "
+	if c.Runnable() {
+		s += c.UseLine() + "\n"
+	} else {
+		s += c.CommandPath() + " [command]\n"
+	}
+	s += "\n"
+	if len(c.Aliases) > 0 {
+		s += "Aliases: " + c.NameAndAliases() + "\n"
+	}
+	if c.HasExample() {
+		s += "Example:\n"
+		s += c.Example + "\n"
+	}
+
+	var managementCommands, nonManagementCommands []*cobra.Command
+	for _, f := range c.Commands() {
+		f := f
+		if f.Annotations[Category] == Management {
+			managementCommands = append(managementCommands, f)
+		} else {
+			nonManagementCommands = append(nonManagementCommands, f)
+		}
+	}
+	printCommands := func(title string, commands []*cobra.Command) string {
+		if len(commands) == 0 {
+			return ""
+		}
+		var longest int
+		for _, f := range commands {
+			if l := len(f.Name()); l > longest {
+				longest = l
+			}
+		}
+		t := title + ":\n"
+		for _, f := range commands {
+			t += "  "
+			t += f.Name()
+			t += strings.Repeat(" ", longest-len(f.Name()))
+			t += "  " + f.Short + "\n"
+		}
+		t += "\n"
+		return t
+	}
+	s += printCommands("Management commands", managementCommands)
+	s += printCommands("Commands", nonManagementCommands)
+
+	s += "Flags:\n"
+	s += c.LocalFlags().FlagUsages() + "\n"
+
+	if c == c.Root() {
+		s += "Run '" + c.CommandPath() + " COMMAND --help' for more information on a command.\n"
+	} else {
+		s += "See also '" + c.Root().CommandPath() + " --help' for the global flags such as '--namespace', '--snapshotter', and '--cgroup-manager'."
+	}
+	fmt.Fprintln(c.OutOrStdout(), s)
+	return nil
+}
 
 func main() {
 	if err := xmain(); err != nil {
@@ -71,22 +112,10 @@ func main() {
 }
 
 func xmain() error {
-	loggingMode := false
-	for _, arg := range os.Args {
-		if arg == logging.MagicArgv1 {
-			loggingMode = true
-			break
-		}
-	}
-	if len(os.Args) >= 3 && loggingMode {
+	if len(os.Args) == 3 && os.Args[1] == logging.MagicArgv1 {
 		// containerd runtime v2 logging plugin mode.
-		// "binary://BIN?KEY1=VALUE1&KEY2=VALUE2" URI is parsed into Args {BIN, KEY1, VALUE1, KEY2, VALUE2}.
-		argsMap := make(map[string]string)
-		args := os.Args[1:]
-		for i := 0; i < len(args); i += 2 {
-			argsMap[args[i]] = args[i+1]
-		}
-		return logging.Main(argsMap)
+		// "binary://BIN?KEY=VALUE" URI is parsed into Args {BIN, KEY, VALUE}.
+		return logging.Main(os.Args[2])
 	}
 	// nerdctl CLI mode
 	app, err := newApp()
@@ -110,6 +139,7 @@ type Config struct {
 	CgroupManager    string   `toml:"cgroup_manager"`
 	InsecureRegistry bool     `toml:"insecure_registry"`
 	HostsDir         []string `toml:"hosts_dir"`
+	Experimental     bool     `toml:"experimental"`
 }
 
 // NewConfig creates a default Config object statically,
@@ -127,44 +157,49 @@ func NewConfig() *Config {
 		CgroupManager:    ncdefaults.CgroupManager(),
 		InsecureRegistry: false,
 		HostsDir:         ncdefaults.HostsDirs(),
+		Experimental:     true,
 	}
 }
 
-func initRootCmdFlags(rootCmd *cobra.Command, tomlPath string) error {
+func initRootCmdFlags(rootCmd *cobra.Command, tomlPath string) (*pflag.FlagSet, error) {
 	cfg := NewConfig()
 	if r, err := os.Open(tomlPath); err == nil {
 		logrus.Debugf("Loading config from %q", tomlPath)
 		defer r.Close()
 		dec := toml.NewDecoder(r).Strict(true) // set Strict to detect typo
 		if err := dec.Decode(cfg); err != nil {
-			return fmt.Errorf("failed to load nerdctl config (not daemon config) from %q (Hint: don't mix up daemon's `config.toml` with `nerdctl.toml`): %w", tomlPath, err)
+			return nil, fmt.Errorf("failed to load nerdctl config (not daemon config) from %q (Hint: don't mix up daemon's `config.toml` with `nerdctl.toml`): %w", tomlPath, err)
 		}
 		logrus.Debugf("Loaded config %+v", cfg)
 	} else {
 		logrus.WithError(err).Debugf("Not loading config from %q", tomlPath)
 		if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return nil, err
 		}
 	}
+	aliasToBeInherited := pflag.NewFlagSet(rootCmd.Name(), pflag.ExitOnError)
+
 	rootCmd.PersistentFlags().Bool("debug", cfg.Debug, "debug mode")
 	rootCmd.PersistentFlags().Bool("debug-full", cfg.DebugFull, "debug mode (with full output)")
-	// -a is nonPersistentAlias (conflicts with nerdctl images -a)
-	AddPersistentStringFlag(rootCmd, "address", []string{"host"}, []string{"a", "H"}, cfg.Address, "CONTAINERD_ADDRESS", `containerd address, optionally with "unix://" prefix`)
-	// -n is nonPersistentAlias (conflicts with nerdctl logs -n)
-	AddPersistentStringFlag(rootCmd, "namespace", nil, []string{"n"}, cfg.Namespace, "CONTAINERD_NAMESPACE", `containerd namespace, such as "moby" for Docker, "k8s.io" for Kubernetes`)
+	// -a is aliases (conflicts with nerdctl images -a)
+	AddPersistentStringFlag(rootCmd, "address", []string{"a", "H"}, nil, []string{"host"}, aliasToBeInherited, cfg.Address, "CONTAINERD_ADDRESS", `containerd address, optionally with "unix://" prefix`)
+	// -n is aliases (conflicts with nerdctl logs -n)
+	AddPersistentStringFlag(rootCmd, "namespace", []string{"n"}, nil, nil, aliasToBeInherited, cfg.Namespace, "CONTAINERD_NAMESPACE", `containerd namespace, such as "moby" for Docker, "k8s.io" for Kubernetes`)
 	rootCmd.RegisterFlagCompletionFunc("namespace", shellCompleteNamespaceNames)
-	AddPersistentStringFlag(rootCmd, "snapshotter", []string{"storage-driver"}, nil, cfg.Snapshotter, "CONTAINERD_SNAPSHOTTER", "containerd snapshotter")
+	AddPersistentStringFlag(rootCmd, "snapshotter", nil, nil, []string{"storage-driver"}, aliasToBeInherited, cfg.Snapshotter, "CONTAINERD_SNAPSHOTTER", "containerd snapshotter")
 	rootCmd.RegisterFlagCompletionFunc("snapshotter", shellCompleteSnapshotterNames)
 	rootCmd.RegisterFlagCompletionFunc("storage-driver", shellCompleteSnapshotterNames)
-	AddPersistentStringFlag(rootCmd, "cni-path", nil, nil, cfg.CNIPath, "CNI_PATH", "cni plugins binary directory")
-	AddPersistentStringFlag(rootCmd, "cni-netconfpath", nil, nil, cfg.CNINetConfPath, "NETCONFPATH", "cni config directory")
+	AddPersistentStringFlag(rootCmd, "cni-path", nil, nil, nil, aliasToBeInherited, cfg.CNIPath, "CNI_PATH", "cni plugins binary directory")
+	AddPersistentStringFlag(rootCmd, "cni-netconfpath", nil, nil, nil, aliasToBeInherited, cfg.CNINetConfPath, "NETCONFPATH", "cni config directory")
 	rootCmd.PersistentFlags().String("data-root", cfg.DataRoot, "Root directory of persistent nerdctl state (managed by nerdctl, not by containerd)")
 	rootCmd.PersistentFlags().String("cgroup-manager", cfg.CgroupManager, `Cgroup manager to use ("cgroupfs"|"systemd")`)
 	rootCmd.RegisterFlagCompletionFunc("cgroup-manager", shellCompleteCgroupManagerNames)
 	rootCmd.PersistentFlags().Bool("insecure-registry", cfg.InsecureRegistry, "skips verifying HTTPS certs, and allows falling back to plain HTTP")
 	// hosts-dir is defined as StringSlice, not StringArray, to allow specifying "--hosts-dir=/etc/containerd/certs.d,/etc/docker/certs.d"
 	rootCmd.PersistentFlags().StringSlice("hosts-dir", cfg.HostsDir, "A directory that contains <HOST:PORT>/hosts.toml (containerd style) or <HOST:PORT>/{ca.cert, cert.pem, key.pem} (docker style)")
-	return nil
+	// Experimental enable experimental feature, see in https://github.com/containerd/nerdctl/blob/master/docs/experimental.md
+	AddPersistentBoolFlag(rootCmd, "experimental", nil, nil, cfg.Experimental, "NERDCTL_EXPERIMENTAL", "Control experimental: https://github.com/containerd/nerdctl/blob/master/docs/experimental.md")
+	return aliasToBeInherited, nil
 }
 
 func newApp() (*cobra.Command, error) {
@@ -187,8 +222,10 @@ Config file ($NERDCTL_TOML): %s
 		SilenceErrors:    true,
 		TraverseChildren: true, // required for global short hands like -a, -H, -n
 	}
-	rootCmd.SetUsageTemplate(mainHelpTemplate)
-	if err := initRootCmdFlags(rootCmd, tomlPath); err != nil {
+
+	rootCmd.SetUsageFunc(usage)
+	aliasToBeInherited, err := initRootCmdFlags(rootCmd, tomlPath)
+	if err != nil {
 		return nil, err
 	}
 
@@ -306,6 +343,11 @@ Config file ($NERDCTL_TOML): %s
 	)
 	addApparmorCommand(rootCmd)
 	addCpCommand(rootCmd)
+
+	// add aliasToBeInherited to subCommand(s) InheritedFlags
+	for _, subCmd := range rootCmd.Commands() {
+		subCmd.InheritedFlags().AddFlagSet(aliasToBeInherited)
+	}
 	return rootCmd, nil
 }
 
@@ -320,7 +362,7 @@ func globalFlags(cmd *cobra.Command) (string, []string) {
 	}
 
 	rootCmd := cmd.Root()
-	flagSet := rootCmd.PersistentFlags()
+	flagSet := rootCmd.Flags()
 	args := []string{}
 	flagSet.VisitAll(func(f *pflag.Flag) {
 		key := f.Name
@@ -399,7 +441,7 @@ func AddStringFlag(cmd *cobra.Command, name string, aliases []string, value stri
 
 // AddPersistentStringFlag is similar to AddStringFlag but persistent.
 // See https://github.com/spf13/cobra/blob/master/user_guide.md#persistent-flags to learn what is "persistent".
-func AddPersistentStringFlag(cmd *cobra.Command, name string, aliases, nonPersistentAliases []string, value string, env, usage string) {
+func AddPersistentStringFlag(cmd *cobra.Command, name string, aliases, localAliases, persistentAliases []string, aliasToBeInherited *pflag.FlagSet, value string, env, usage string) {
 	if env != "" {
 		usage = fmt.Sprintf("%s [$%s]", usage, env)
 	}
@@ -408,24 +450,79 @@ func AddPersistentStringFlag(cmd *cobra.Command, name string, aliases, nonPersis
 	}
 	aliasesUsage := fmt.Sprintf("Alias of --%s", name)
 	p := new(string)
+
+	// flags is full set of flag(s)
+	// flags can redefine alias already used in subcommands
 	flags := cmd.Flags()
-	for _, a := range nonPersistentAliases {
+	for _, a := range aliases {
 		if len(a) == 1 {
 			// pflag doesn't support short-only flags, so we have to register long one as well here
 			flags.StringVarP(p, a, a, value, aliasesUsage)
 		} else {
 			flags.StringVar(p, a, value, aliasesUsage)
 		}
+		// non-persistent flags are not added to the InheritedFlags, so we should add them manually
+		f := flags.Lookup(a)
+		aliasToBeInherited.AddFlag(f)
 	}
 
+	// localFlags are local to the rootCmd
+	localFlags := cmd.LocalFlags()
+	for _, a := range localAliases {
+		if len(a) == 1 {
+			// pflag doesn't support short-only flags, so we have to register long one as well here
+			localFlags.StringVarP(p, a, a, value, aliasesUsage)
+		} else {
+			localFlags.StringVar(p, a, value, aliasesUsage)
+		}
+	}
+
+	// persistentFlags cannot redefine alias already used in subcommands
 	persistentFlags := cmd.PersistentFlags()
 	persistentFlags.StringVar(p, name, value, usage)
-	for _, a := range aliases {
+	for _, a := range persistentAliases {
 		if len(a) == 1 {
 			// pflag doesn't support short-only flags, so we have to register long one as well here
 			persistentFlags.StringVarP(p, a, a, value, aliasesUsage)
 		} else {
 			persistentFlags.StringVar(p, a, value, aliasesUsage)
+		}
+	}
+}
+
+// AddPersistentBoolFlag is similar to AddBoolFlag but persistent.
+// See https://github.com/spf13/cobra/blob/master/user_guide.md#persistent-flags to learn what is "persistent".
+func AddPersistentBoolFlag(cmd *cobra.Command, name string, aliases, nonPersistentAliases []string, value bool, env, usage string) {
+	if env != "" {
+		usage = fmt.Sprintf("%s [$%s]", usage, env)
+	}
+	if envV, ok := os.LookupEnv(env); ok {
+		var err error
+		value, err = strconv.ParseBool(envV)
+		if err != nil {
+			logrus.WithError(err).Warnf("Invalid boolean value for `%s`", env)
+		}
+	}
+	aliasesUsage := fmt.Sprintf("Alias of --%s", name)
+	p := new(bool)
+	flags := cmd.Flags()
+	for _, a := range nonPersistentAliases {
+		if len(a) == 1 {
+			// pflag doesn't support short-only flags, so we have to register long one as well here
+			flags.BoolVarP(p, a, a, value, aliasesUsage)
+		} else {
+			flags.BoolVar(p, a, value, aliasesUsage)
+		}
+	}
+
+	persistentFlags := cmd.PersistentFlags()
+	persistentFlags.BoolVar(p, name, value, usage)
+	for _, a := range aliases {
+		if len(a) == 1 {
+			// pflag doesn't support short-only flags, so we have to register long one as well here
+			persistentFlags.BoolVarP(p, a, a, value, aliasesUsage)
+		} else {
+			persistentFlags.BoolVar(p, a, value, aliasesUsage)
 		}
 	}
 }
@@ -460,5 +557,18 @@ func AddPersistentStringArrayFlag(cmd *cobra.Command, name string, aliases, nonP
 		} else {
 			persistentFlags.StringArrayVar(p, a, value, aliasesUsage)
 		}
+	}
+}
+
+func checkExperimental(feature string) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		experimental, err := cmd.Flags().GetBool("experimental")
+		if err != nil {
+			return err
+		}
+		if !experimental {
+			return fmt.Errorf("%s is experimental feature, you should enable experimental config", feature)
+		}
+		return nil
 	}
 }

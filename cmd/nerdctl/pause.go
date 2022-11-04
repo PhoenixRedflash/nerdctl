@@ -50,6 +50,9 @@ func pauseAction(cmd *cobra.Command, args []string) error {
 	walker := &containerwalker.ContainerWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
 			if err := pauseContainer(ctx, client, found.Container.ID()); err != nil {
 				return err
 			}
@@ -87,9 +90,9 @@ func pauseContainer(ctx context.Context, client *containerd.Client, id string) e
 
 	switch status.Status {
 	case containerd.Paused:
-		return fmt.Errorf("Container %s is already paused", id)
+		return fmt.Errorf("container %s is already paused", id)
 	case containerd.Created, containerd.Stopped:
-		return fmt.Errorf("Container %s is not running", id)
+		return fmt.Errorf("container %s is not running", id)
 	default:
 		return task.Pause(ctx)
 	}

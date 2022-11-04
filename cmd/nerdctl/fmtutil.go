@@ -47,7 +47,7 @@ func formatLabels(labels map[string]string) string {
 
 // formatSlice formats the slice with `--format` flag.
 //
-// --format='' (default): JSON
+// --format="" (default): JSON
 // --format='{{json .}}': JSON lines
 //
 // formatSlice is expected to be only used for `nerdctl OBJECT inspect` commands.
@@ -107,7 +107,7 @@ func tryRawFormat(b *bytes.Buffer, f interface{}, tmpl *template.Template) error
 
 	tmplMissingKey := tmpl.Option("missingkey=error")
 	if rawErr := tmplMissingKey.Execute(b, raw); rawErr != nil {
-		return fmt.Errorf("Template parsing error: %v", rawErr)
+		return fmt.Errorf("template parsing error: %v", rawErr)
 	}
 
 	return nil

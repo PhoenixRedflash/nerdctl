@@ -19,11 +19,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/containerd/nerdctl/pkg/apparmorutil"
+	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/containerd/nerdctl/pkg/testutil"
 
 	"gotest.tools/v3/assert"
@@ -48,8 +50,8 @@ func getCapEff(base *testutil.Base, args ...string) uint64 {
 }
 
 const (
-	CAP_NET_RAW  = 13
-	CAP_IPC_LOCK = 14
+	CapNetRaw  = 13
+	CapIPCLock = 14
 )
 
 func TestRunCap(t *testing.T) {
@@ -78,27 +80,27 @@ func TestRunCap(t *testing.T) {
 		},
 		{
 			args:   []string{"--cap-add=ipc_lock"},
-			capEff: (allCaps & defaultCaps) | (1 << CAP_IPC_LOCK),
+			capEff: (allCaps & defaultCaps) | (1 << CapIPCLock),
 		},
 		{
 			args:   []string{"--cap-add=all", "--cap-drop=net_raw"},
-			capEff: allCaps ^ (1 << CAP_NET_RAW),
+			capEff: allCaps ^ (1 << CapNetRaw),
 		},
 		{
 			args:   []string{"--cap-drop=all", "--cap-add=net_raw"},
-			capEff: 1 << CAP_NET_RAW,
+			capEff: 1 << CapNetRaw,
 		},
 		{
 			args:   []string{"--cap-drop=all", "--cap-add=NET_RAW"},
-			capEff: 1 << CAP_NET_RAW,
+			capEff: 1 << CapNetRaw,
 		},
 		{
 			args:   []string{"--cap-drop=all", "--cap-add=cap_net_raw"},
-			capEff: 1 << CAP_NET_RAW,
+			capEff: 1 << CapNetRaw,
 		},
 		{
 			args:   []string{"--cap-drop=all", "--cap-add=CAP_NET_RAW"},
-			capEff: 1 << CAP_NET_RAW,
+			capEff: 1 << CapNetRaw,
 		},
 	}
 	for _, tc := range testCases {
@@ -189,4 +191,41 @@ func TestRunSeccompCapSysPtrace(t *testing.T) {
 	base := testutil.NewBase(t)
 	base.Cmd("run", "--rm", "--cap-add", "sys_ptrace", testutil.AlpineImage, "sh", "-euxc", "apk add -q strace && strace true").AssertOK()
 	// Docker/Moby 's seccomp profile allows ptrace(2) by default, but containerd does not (yet): https://github.com/containerd/containerd/issues/6802
+}
+
+func TestRunPrivileged(t *testing.T) {
+	// docker does not support --privileged-without-host-devices
+	testutil.DockerIncompatible(t)
+
+	if rootlessutil.IsRootless() {
+		t.Skip("test skipped for rootless privileged containers")
+	}
+
+	base := testutil.NewBase(t)
+
+	devPath := "/dev/dummy-zero"
+
+	// a dummy zero device: mknod /dev/dummy-zero c 1 5
+	helperCmd := exec.Command("mknod", []string{devPath, "c", "1", "5"}...)
+	if out, err := helperCmd.CombinedOutput(); err != nil {
+		err = fmt.Errorf("cannot create %q: %q: %w", devPath, string(out), err)
+		t.Fatal(err)
+	}
+
+	// ensure the file will be removed in case of failed in the test
+	defer func() {
+		exec.Command("rm", devPath).Run()
+	}()
+
+	// get device with host devices
+	base.Cmd("run", "--rm", "--privileged", testutil.AlpineImage, "ls", devPath).AssertOutExactly(devPath + "\n")
+
+	// get device without host devices
+	res := base.Cmd("run", "--rm", "--privileged", "--security-opt", "privileged-without-host-devices", testutil.AlpineImage, "ls", devPath).Run()
+
+	// normally for not a exists file, the `ls` will return `1``.
+	assert.Check(t, res.ExitCode != 0, res.Combined())
+
+	// something like `ls: /dev/dummy-zero: No such file or directory`
+	assert.Check(t, strings.Contains(res.Combined(), "No such file or directory"))
 }

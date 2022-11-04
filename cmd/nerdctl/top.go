@@ -98,6 +98,9 @@ func topAction(cmd *cobra.Command, args []string) error {
 	walker := &containerwalker.ContainerWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
 			if err := containerTop(ctx, cmd, client, found.Container.ID(), strings.Join(args[1:], " ")); err != nil {
 				return err
 			}
@@ -145,7 +148,7 @@ func validatePSArgs(psArgs string) error {
 	// So we use fieldsASCII instead of strings.Fields in parsePSOutput.
 	// See https://github.com/docker/docker/pull/24358
 	// nolint: gosimple
-	re := regexp.MustCompile("\\s+([^\\s]*)=\\s*(PID[^\\s]*)")
+	re := regexp.MustCompile(`\s+(\S*)=\s*(PID\S*)`)
 	for _, group := range re.FindAllStringSubmatch(psArgs, -1) {
 		if len(group) >= 3 {
 			k := group[1]
@@ -197,7 +200,7 @@ func parsePSOutput(output []byte, procs []uint32) (*ContainerTopOKBody, error) {
 		}
 	}
 	if pidIndex == -1 {
-		return nil, fmt.Errorf("Couldn't find PID field in ps output")
+		return nil, fmt.Errorf("couldn't find PID field in ps output")
 	}
 
 	// loop through the output and extract the PID from each line
@@ -223,7 +226,7 @@ func parsePSOutput(output []byte, procs []uint32) (*ContainerTopOKBody, error) {
 		}
 		p, err = strconv.Atoi(fields[pidIndex])
 		if err != nil {
-			return nil, fmt.Errorf("Unexpected pid '%s': %s", fields[pidIndex], err)
+			return nil, fmt.Errorf("unexpected pid '%s': %s", fields[pidIndex], err)
 		}
 
 		if hasPid(procs, p) {

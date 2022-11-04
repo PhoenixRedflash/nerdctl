@@ -36,7 +36,6 @@ import (
 	dockercliconfig "github.com/docker/cli/cli/config"
 	dockercliconfigtypes "github.com/docker/cli/cli/config/types"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/registry"
 	"golang.org/x/net/context/ctxhttp"
 	"golang.org/x/term"
 
@@ -62,7 +61,7 @@ func newLoginCommand() *cobra.Command {
 	var loginCommand = &cobra.Command{
 		Use:           "login [flags] [SERVER]",
 		Args:          cobra.MaximumNArgs(1),
-		Short:         "Log in to a Docker registry",
+		Short:         "Log in to a container registry",
 		RunE:          loginAction,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -89,14 +88,14 @@ func loginAction(cmd *cobra.Command, args []string) error {
 	var serverAddress string
 
 	if options.serverAddress == "" {
-		serverAddress = registry.IndexServer
+		serverAddress = dockerconfigresolver.IndexServer
 	} else {
 		serverAddress = options.serverAddress
 	}
 
 	var responseIdentityToken string
 	ctx := cmd.Context()
-	isDefaultRegistry := serverAddress == registry.IndexServer
+	isDefaultRegistry := serverAddress == dockerconfigresolver.IndexServer
 
 	authConfig, err := GetDefaultAuthConfig(options.username == "" && options.password == "", serverAddress, isDefaultRegistry)
 	if authConfig == nil {
@@ -150,7 +149,7 @@ func loginAction(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-//copied from github.com/docker/cli/cli/command/registry/login.go (v20.10.3)
+// copied from github.com/docker/cli/cli/command/registry/login.go (v20.10.3)
 func verifyloginOptions(cmd *cobra.Command, options *loginOptions) error {
 	if options.password != "" {
 		logrus.Warn("WARNING! Using --password via the CLI is insecure. Use --password-stdin.")

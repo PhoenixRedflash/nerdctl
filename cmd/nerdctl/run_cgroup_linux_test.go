@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/containerd/cgroups"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/continuity/testutil/loopback"
 	"github.com/containerd/nerdctl/pkg/testutil"
 	"gotest.tools/v3/assert"
@@ -44,6 +44,9 @@ func TestRunCgroupV2(t *testing.T) {
 	if !info.MemoryLimit {
 		t.Skip("test requires MemoryLimit")
 	}
+	if !info.SwapLimit {
+		t.Skip("test requires SwapLimit")
+	}
 	if !info.CPUShares {
 		t.Skip("test requires CPUShares")
 	}
@@ -53,29 +56,79 @@ func TestRunCgroupV2(t *testing.T) {
 	if !info.PidsLimit {
 		t.Skip("test requires PidsLimit")
 	}
-
-	const expected = `42000 100000
+	const expected1 = `42000 100000
+44040192
 44040192
 42
 77
 0-1
 0
 `
-	//In CgroupV2 CPUWeight replace CPUShares => weight := 1 + ((shares-2)*9999)/262142
-	base.Cmd("run", "--rm", "--cpus", "0.42", "--cpuset-mems", "0", "--memory", "42m", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", "-w", "/sys/fs/cgroup", testutil.AlpineImage,
-		"cat", "cpu.max", "memory.max", "pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected)
-	base.Cmd("run", "--rm", "--cpu-quota", "42000", "--cpuset-mems", "0", "--cpu-period", "100000", "--memory", "42m", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", "-w", "/sys/fs/cgroup", testutil.AlpineImage,
-		"cat", "cpu.max", "memory.max", "pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected)
+	const expected2 = `42000 100000
+44040192
+60817408
+6291456
+42
+77
+0-1
+0
+`
 
-	base.Cmd("run", "--name", testutil.Identifier(t)+"-testUpdate", "-w", "/sys/fs/cgroup", "-d", testutil.AlpineImage, "sleep", "infinity").AssertOK()
-	base.Cmd("update", "--cpu-quota", "42000", "--cpuset-mems", "0", "--cpu-period", "100000", "--memory", "42m", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", testutil.Identifier(t)+"-testUpdate").AssertOK()
-	base.Cmd("exec", testutil.Identifier(t)+"-testUpdate", "cat", "cpu.max", "memory.max", "pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected)
-	base.Cmd("rm", "-f", testutil.Identifier(t)+"-testUpdate").AssertOK()
+	// In CgroupV2 CPUWeight replace CPUShares => weight := 1 + ((shares-2)*9999)/262142
+	base.Cmd("run", "--rm",
+		"--cpus", "0.42", "--cpuset-mems", "0",
+		"--memory", "42m",
+		"--pids-limit", "42",
+		"--cpu-shares", "2000", "--cpuset-cpus", "0-1",
+		"-w", "/sys/fs/cgroup", testutil.AlpineImage,
+		"cat", "cpu.max", "memory.max", "memory.swap.max",
+		"pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected1)
+	base.Cmd("run", "--rm",
+		"--cpu-quota", "42000", "--cpuset-mems", "0",
+		"--cpu-period", "100000", "--memory", "42m", "--memory-reservation", "6m", "--memory-swap", "100m",
+		"--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1",
+		"-w", "/sys/fs/cgroup", testutil.AlpineImage,
+		"cat", "cpu.max", "memory.max", "memory.swap.max", "memory.low", "pids.max",
+		"cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected2)
+
+	base.Cmd("run", "--name", testutil.Identifier(t)+"-testUpdate1", "-w", "/sys/fs/cgroup", "-d",
+		testutil.AlpineImage, "sleep", "infinity").AssertOK()
+	defer base.Cmd("rm", "-f", testutil.Identifier(t)+"-testUpdate1").Run()
+	update := []string{"update", "--cpu-quota", "42000", "--cpuset-mems", "0", "--cpu-period", "100000",
+		"--memory", "42m",
+		"--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1"}
+	if base.Target == testutil.Docker && info.CgroupVersion == "2" && info.SwapLimit {
+		// Workaround for Docker with cgroup v2:
+		// > Error response from daemon: Cannot update container 67c13276a13dd6a091cdfdebb355aa4e1ecb15fbf39c2b5c9abee89053e88fce:
+		// > Memory limit should be smaller than already set memoryswap limit, update the memoryswap at the same time
+		update = append(update, "--memory-swap=84m")
+	}
+	update = append(update, testutil.Identifier(t)+"-testUpdate1")
+	base.Cmd(update...).AssertOK()
+	base.Cmd("exec", testutil.Identifier(t)+"-testUpdate1",
+		"cat", "cpu.max", "memory.max", "memory.swap.max",
+		"pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected1)
+
+	defer base.Cmd("rm", "-f", testutil.Identifier(t)+"-testUpdate2").Run()
+	base.Cmd("run", "--name", testutil.Identifier(t)+"-testUpdate2", "-w", "/sys/fs/cgroup", "-d",
+		testutil.AlpineImage, "sleep", "infinity").AssertOK()
+	base.EnsureContainerStarted(testutil.Identifier(t) + "-testUpdate2")
+
+	base.Cmd("update", "--cpu-quota", "42000", "--cpuset-mems", "0", "--cpu-period", "100000",
+		"--memory", "42m", "--memory-reservation", "6m", "--memory-swap", "100m",
+		"--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1",
+		testutil.Identifier(t)+"-testUpdate2").AssertOK()
+	base.Cmd("exec", testutil.Identifier(t)+"-testUpdate2",
+		"cat", "cpu.max", "memory.max", "memory.swap.max", "memory.low",
+		"pids.max", "cpu.weight", "cpuset.cpus", "cpuset.mems").AssertOutExactly(expected2)
+
 }
 
 func TestRunCgroupV1(t *testing.T) {
 	t.Parallel()
-	if cgroups.Mode() != cgroups.Legacy {
+	switch cgroups.Mode() {
+	case cgroups.Legacy, cgroups.Hybrid:
+	default:
 		t.Skip("test requires cgroup v1")
 	}
 	base := testutil.NewBase(t)
@@ -98,19 +151,22 @@ func TestRunCgroupV1(t *testing.T) {
 	}
 	quota := "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
 	period := "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
-	cpuset_mems := "/sys/fs/cgroup/cpuset/cpuset.mems"
-	memory_limit := "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-	pids_limit := "/sys/fs/cgroup/pids/pids.max"
-	cpu_share := "/sys/fs/cgroup/cpu/cpu.shares"
-	cpuset_cpus := "/sys/fs/cgroup/cpuset/cpuset.cpus"
+	cpusetMems := "/sys/fs/cgroup/cpuset/cpuset.mems"
+	memoryLimit := "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+	memoryReservation := "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes"
+	memorySwap := "/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes"
+	memorySwappiness := "/sys/fs/cgroup/memory/memory.swappiness"
+	pidsLimit := "/sys/fs/cgroup/pids/pids.max"
+	cpuShare := "/sys/fs/cgroup/cpu/cpu.shares"
+	cpusetCpus := "/sys/fs/cgroup/cpuset/cpuset.cpus"
 
-	const expected = "42000\n100000\n0\n44040192\n42\n2000\n0-1\n"
-	base.Cmd("run", "--rm", "--cpus", "0.42", "--cpuset-mems", "0", "--memory", "42m", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", testutil.AlpineImage, "cat", quota, period, cpuset_mems, memory_limit, pids_limit, cpu_share, cpuset_cpus).AssertOutExactly(expected)
-	base.Cmd("run", "--rm", "--cpu-quota", "42000", "--cpu-period", "100000", "--cpuset-mems", "0", "--memory", "42m", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", testutil.AlpineImage, "cat", quota, period, cpuset_mems, memory_limit, pids_limit, cpu_share, cpuset_cpus).AssertOutExactly(expected)
+	const expected = "42000\n100000\n0\n44040192\n6291456\n104857600\n0\n42\n2000\n0-1\n"
+	base.Cmd("run", "--rm", "--cpus", "0.42", "--cpuset-mems", "0", "--memory", "42m", "--memory-reservation", "6m", "--memory-swap", "100m", "--memory-swappiness", "0", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", testutil.AlpineImage, "cat", quota, period, cpusetMems, memoryLimit, memoryReservation, memorySwap, memorySwappiness, pidsLimit, cpuShare, cpusetCpus).AssertOutExactly(expected)
+	base.Cmd("run", "--rm", "--cpu-quota", "42000", "--cpu-period", "100000", "--cpuset-mems", "0", "--memory", "42m", "--memory-reservation", "6m", "--memory-swap", "100m", "--memory-swappiness", "0", "--pids-limit", "42", "--cpu-shares", "2000", "--cpuset-cpus", "0-1", testutil.AlpineImage, "cat", quota, period, cpusetMems, memoryLimit, memoryReservation, memorySwap, memorySwappiness, pidsLimit, cpuShare, cpusetCpus).AssertOutExactly(expected)
 }
 
 func TestRunDevice(t *testing.T) {
-	if os.Geteuid() != 0 || sys.RunningInUserNS() {
+	if os.Geteuid() != 0 || userns.RunningInUserNS() {
 		t.Skip("test requires the root in the initial user namespace")
 	}
 
@@ -213,6 +269,7 @@ func TestRunCgroupConf(t *testing.T) {
 	if cgroups.Mode() != cgroups.Unified {
 		t.Skip("test requires cgroup v2")
 	}
+	testutil.DockerIncompatible(t) // Docker lacks --cgroup-conf
 	base := testutil.NewBase(t)
 	info := base.Info()
 	switch info.CgroupDriver {
@@ -240,7 +297,11 @@ func TestRunBlkioWeightCgroupV2(t *testing.T) {
 	case "none", "":
 		t.Skip("test requires cgroup driver")
 	}
+	containerName := testutil.Identifier(t)
+	defer base.Cmd("rm", "-f", containerName).Run()
 	// when bfq io scheduler is used, the io.weight knob is exposed as io.bfq.weight
-	base.Cmd("run", "--rm", "--blkio-weight", "300", "-w", "/sys/fs/cgroup", testutil.AlpineImage,
-		"cat", "io.bfq.weight").AssertOutExactly("default 300\n")
+	base.Cmd("run", "--name", containerName, "--blkio-weight", "300", "-w", "/sys/fs/cgroup", testutil.AlpineImage, "sleep", "infinity").AssertOK()
+	base.Cmd("exec", containerName, "cat", "io.bfq.weight").AssertOutExactly("default 300\n")
+	base.Cmd("update", containerName, "--blkio-weight", "400").AssertOK()
+	base.Cmd("exec", containerName, "cat", "io.bfq.weight").AssertOutExactly("default 400\n")
 }

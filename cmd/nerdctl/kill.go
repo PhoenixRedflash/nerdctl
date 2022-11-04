@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
 
+	"github.com/moby/sys/signal"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -55,7 +56,7 @@ func killAction(cmd *cobra.Command, args []string) error {
 		killSignal = "SIG" + killSignal
 	}
 
-	signal, err := containerd.ParseSignal(killSignal)
+	signal, err := signal.ParseSignal(killSignal)
 	if err != nil {
 		return err
 	}
@@ -69,9 +70,12 @@ func killAction(cmd *cobra.Command, args []string) error {
 	walker := &containerwalker.ContainerWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
 			if err := killContainer(ctx, found.Container, signal); err != nil {
 				if errdefs.IsNotFound(err) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Error response from daemon: Cannot kill container: %s: No such container: %s\n", found.Req, found.Req)
+					fmt.Fprintf(cmd.ErrOrStderr(), "No such container: %s\n", found.Req)
 					os.Exit(1)
 				}
 				return err
@@ -106,7 +110,7 @@ func killContainer(ctx context.Context, container containerd.Container, signal s
 
 	switch status.Status {
 	case containerd.Created, containerd.Stopped:
-		return fmt.Errorf("cannot kill container: %s: Container %s is not running\n", container.ID(), container.ID())
+		return fmt.Errorf("cannot kill container: %s: Container %s is not running", container.ID(), container.ID())
 	case containerd.Paused, containerd.Pausing:
 		paused = true
 	default:

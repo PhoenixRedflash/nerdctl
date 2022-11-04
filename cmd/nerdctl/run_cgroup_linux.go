@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -31,10 +29,15 @@ import (
 	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/docker/go-units"
 	"github.com/opencontainers/runtime-spec/specs-go"
-
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
+
+type customMemoryOptions struct {
+	MemoryReservation *int64
+	MemorySwappiness  *uint64
+	disableOOMKiller  *bool
+}
 
 func generateCgroupOpts(cmd *cobra.Command, id string) ([]oci.SpecOpts, error) {
 	cgroupManager, err := cmd.Flags().GetString("cgroup-manager")
@@ -49,6 +52,36 @@ func generateCgroupOpts(cmd *cobra.Command, id string) ([]oci.SpecOpts, error) {
 	if err != nil {
 		return nil, err
 	}
+	memSwap, err := cmd.Flags().GetString("memory-swap")
+	if err != nil {
+		return nil, err
+	}
+
+	memSwappiness64, err := cmd.Flags().GetInt64("memory-swappiness")
+	if err != nil {
+		return nil, err
+	}
+	kernelMemStr, err := cmd.Flags().GetString("kernel-memory")
+	if err != nil {
+		return nil, err
+	}
+	if kernelMemStr != "" && cmd.Flag("kernel-memory").Changed {
+		logrus.Warnf("The --kernel-memory flag is no longer supported. This flag is a noop.")
+	}
+
+	memReserve, err := cmd.Flags().GetString("memory-reservation")
+	if err != nil {
+		return nil, err
+	}
+
+	okd, err := cmd.Flags().GetBool("oom-kill-disable")
+	if err != nil {
+		return nil, err
+	}
+	if memStr == "" && okd {
+		logrus.Warn("Disabling the OOM killer on containers without setting a '-m/--memory' limit may be dangerous.")
+	}
+
 	pidsLimit, err := cmd.Flags().GetInt64("pids-limit")
 	if err != nil {
 		return nil, err
@@ -58,7 +91,7 @@ func generateCgroupOpts(cmd *cobra.Command, id string) ([]oci.SpecOpts, error) {
 			return nil, errors.New("cgroup-manager \"none\" is only supported for rootless")
 		}
 
-		if cpus > 0.0 || memStr != "" || pidsLimit > 0 {
+		if cpus > 0.0 || memStr != "" || memSwap != "" || pidsLimit > 0 {
 			logrus.Warn("cgroup manager is set to \"none\", discarding resource limit requests. " +
 				"(Hint: enable cgroup v2 with systemd: https://rootlesscontaine.rs/getting-started/common/cgroup2/)")
 		}
@@ -122,16 +155,68 @@ func generateCgroupOpts(cmd *cobra.Command, id string) ([]oci.SpecOpts, error) {
 	if cpusetMems != "" {
 		opts = append(opts, oci.WithCPUsMems(cpusetMems))
 	}
+	var mem64 int64
 	if memStr != "" {
-		mem64, err := units.RAMInBytes(memStr)
+		mem64, err = units.RAMInBytes(memStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse memory bytes %q: %w", memStr, err)
 		}
 		opts = append(opts, oci.WithMemoryLimit(uint64(mem64)))
+
+	}
+	var memReserve64 int64
+	if memReserve != "" {
+		memReserve64, err = units.RAMInBytes(memReserve)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse memory bytes %q: %w", memReserve, err)
+		}
+	}
+	var memSwap64 int64
+	if memSwap != "" {
+		if memSwap == "-1" {
+			memSwap64 = -1
+		} else {
+			memSwap64, err = units.RAMInBytes(memSwap)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse memory-swap bytes %q: %w", memSwap, err)
+			}
+			if mem64 > 0 && memSwap64 > 0 && memSwap64 < mem64 {
+				return nil, fmt.Errorf("minimum memoryswap limit should be larger than memory limit, see usage")
+			}
+		}
+	} else {
+		// if `--memory-swap` is unset, the container can use as much swap as the `--memory` setting.
+		memSwap64 = mem64 * 2
+	}
+	if memSwap64 == 0 {
+		// if --memory-swap is set to 0, the setting is ignored, and the value is treated as unset.
+		memSwap64 = mem64 * 2
+	}
+	if memSwap64 != 0 {
+		opts = append(opts, oci.WithMemorySwap(memSwap64))
+	}
+	if mem64 > 0 && memReserve64 > 0 && mem64 < memReserve64 {
+		return nil, fmt.Errorf("minimum memory limit can not be less than memory reservation limit, see usage")
+	}
+	if memSwappiness64 > 100 || memSwappiness64 < -1 {
+		return nil, fmt.Errorf("invalid value: %v, valid memory swappiness range is 0-100", memSwappiness64)
 	}
 
+	var customMemRes customMemoryOptions
+	if memReserve64 >= 0 && cmd.Flags().Changed("memory-reservation") {
+		customMemRes.MemoryReservation = &memReserve64
+	}
+	if memSwappiness64 >= 0 && cmd.Flags().Changed("memory-swappiness") {
+		memSwapinessUint64 := uint64(memSwappiness64)
+		customMemRes.MemorySwappiness = &memSwapinessUint64
+	}
+	if okd {
+		customMemRes.disableOOMKiller = &okd
+	}
+	opts = append(opts, withCustomMemoryResources(customMemRes))
+
 	if pidsLimit > 0 {
-		opts = append(opts, oci.WithPidsLimit(int64(pidsLimit)))
+		opts = append(opts, oci.WithPidsLimit(pidsLimit))
 	}
 
 	cgroupConf, err := cmd.Flags().GetStringSlice("cgroup-conf")
@@ -156,17 +241,9 @@ func generateCgroupOpts(cmd *cobra.Command, id string) ([]oci.SpecOpts, error) {
 	if err != nil {
 		return nil, err
 	}
-	if infoutil.CgroupsVersion() == "1" && blkioWeight != 0 {
-		blkioController := "/sys/fs/cgroup/blkio"
-		blkioWeightPath := filepath.Join(blkioController, "blkio.weight")
-		if _, err := os.Stat(blkioWeightPath); errors.Is(err, fs.ErrNotExist) {
-			// if bfq io scheduler is used, the blkio.weight knob will be exposed as blkio.bfq.weight
-			blkioBfqWeightPath := filepath.Join(blkioController, "blkio.bfq.weight")
-			if _, err := os.Stat(blkioBfqWeightPath); errors.Is(err, fs.ErrNotExist) {
-				logrus.Warn("kernel support for cgroup blkio weight missing, weight discarded")
-				blkioWeight = 0
-			}
-		}
+	if blkioWeight != 0 && !infoutil.BlockIOWeight(cgroupManager) {
+		logrus.Warn("kernel support for cgroup blkio weight missing, weight discarded")
+		blkioWeight = 0
 	}
 	if blkioWeight > 0 && blkioWeight < 10 || blkioWeight > 1000 {
 		return nil, errors.New("range of blkio weight is from 10 to 1000")
@@ -271,6 +348,29 @@ func withBlkioWeight(blkioWeight uint16) oci.SpecOpts {
 			return nil
 		}
 		s.Linux.Resources.BlockIO = &specs.LinuxBlockIO{Weight: &blkioWeight}
+		return nil
+	}
+}
+
+func withCustomMemoryResources(memoryOptions customMemoryOptions) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Linux != nil {
+			if s.Linux.Resources == nil {
+				s.Linux.Resources = &specs.LinuxResources{}
+			}
+			if s.Linux.Resources.Memory == nil {
+				s.Linux.Resources.Memory = &specs.LinuxMemory{}
+			}
+			if memoryOptions.disableOOMKiller != nil {
+				s.Linux.Resources.Memory.DisableOOMKiller = memoryOptions.disableOOMKiller
+			}
+			if memoryOptions.MemorySwappiness != nil {
+				s.Linux.Resources.Memory.Swappiness = memoryOptions.MemorySwappiness
+			}
+			if memoryOptions.MemoryReservation != nil {
+				s.Linux.Resources.Memory.Reservation = memoryOptions.MemoryReservation
+			}
+		}
 		return nil
 	}
 }

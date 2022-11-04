@@ -77,7 +77,7 @@ func TestIPFSCommit(t *testing.T) {
 	newContainer, newImg := tID, tID+":v1"
 	base.Cmd("run", "--name", newContainer, "-d", ipfsCID, "/bin/sh", "-c", "echo hello > /hello ; sleep 10000").AssertOK()
 	base.Cmd("commit", newContainer, newImg).AssertOK()
-	base.Cmd("stop", newContainer).AssertOK()
+	base.Cmd("kill", newContainer).AssertOK()
 	base.Cmd("rm", newContainer).AssertOK()
 	ipfsCID2 := cidOf(t, base.Cmd("push", "ipfs://"+newImg).OutLines())
 	rmiAll(base)
@@ -115,7 +115,7 @@ func TestIPFSWithLazyPullingCommit(t *testing.T) {
 	newContainer, newImg := tID, tID+":v1"
 	base.Cmd("run", "--name", newContainer, "-d", ipfsCID, "/bin/sh", "-c", "echo hello > /hello ; sleep 10000").AssertOK()
 	base.Cmd("commit", newContainer, newImg).AssertOK()
-	base.Cmd("stop", newContainer).AssertOK()
+	base.Cmd("kill", newContainer).AssertOK()
 	base.Cmd("rm", newContainer).AssertOK()
 	ipfsCID2 := cidOf(t, base.Cmd("push", "--estargz", "ipfs://"+newImg).OutLines())
 	rmiAll(base)
@@ -143,5 +143,4 @@ func requiresIPFS(t *testing.T) {
 	if _, err := httpapi.NewLocalApi(); err != nil {
 		t.Skipf("test requires ipfs daemon, but got: %v", err)
 	}
-	return
 }

@@ -59,6 +59,8 @@ func newComposeCommand() *cobra.Command {
 		newComposeDownCommand(),
 		newComposePsCommand(),
 		newComposeKillCommand(),
+		newComposeRunCommand(),
+		newComposeVersionCommand(),
 	)
 
 	return composeCommand
@@ -137,7 +139,7 @@ func getComposer(cmd *cobra.Command, client *containerd.Client) (*composer.Compo
 	}
 
 	o.VolumeExists = func(volName string) (bool, error) {
-		if _, volGetErr := volStore.Get(volName); volGetErr == nil {
+		if _, volGetErr := volStore.Get(volName, false); volGetErr == nil {
 			return true, nil
 		} else if errors.Is(volGetErr, errdefs.ErrNotFound) {
 			return false, nil

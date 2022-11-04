@@ -34,6 +34,7 @@ func newNetworkCommand() *cobra.Command {
 		newNetworkInspectCommand(),
 		newNetworkCreateCommand(),
 		newNetworkRmCommand(),
+		newNetworkPruneCommand(),
 	)
 	return networkCommand
 }

@@ -18,10 +18,9 @@ package main
 
 import (
 	"fmt"
-	"os"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/identifiers"
-	"github.com/containerd/nerdctl/pkg/lockutil"
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/strutil"
 
@@ -32,7 +31,7 @@ func newNetworkCreateCommand() *cobra.Command {
 	var networkCreateCommand = &cobra.Command{
 		Use:           "create [flags] NETWORK",
 		Short:         "Create a network",
-		Long:          "NOTE: To isolate CNI bridge, CNI isolation plugin needs to be installed: https://github.com/AkihiroSuda/cni-isolation",
+		Long:          `NOTE: To isolate CNI bridge, CNI plugin "firewall" (>= v1.1.0) is needed.`,
 		Args:          cobra.ExactArgs(1),
 		RunE:          networkCreateAction,
 		SilenceUsage:  true,
@@ -62,9 +61,6 @@ func networkCreateAction(cmd *cobra.Command, args []string) error {
 	}
 	cniNetconfpath, err := cmd.Flags().GetString("cni-netconfpath")
 	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(cniNetconfpath, 0755); err != nil {
 		return err
 	}
 	driver, err := cmd.Flags().GetString("driver")
@@ -99,52 +95,36 @@ func networkCreateAction(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	labels = strutil.DedupeStrSlice(labels)
 
-	fn := func() error {
-		e, err := netutil.NewCNIEnv(cniPath, cniNetconfpath)
-		if err != nil {
-			return err
+	if subnetStr == "" {
+		if gatewayStr != "" || ipRangeStr != "" {
+			return fmt.Errorf("cannot set gateway or ip-range without subnet, specify --subnet manually")
 		}
-		for _, n := range e.Networks {
-			if n.Name == name {
-				return fmt.Errorf("network with name %s already exists", name)
-			}
-			// TODO: check CIDR collision
-		}
-		id, err := e.AcquireNextID()
-		if err != nil {
-			return err
-		}
-
-		if subnetStr == "" {
-			if gatewayStr != "" || ipRangeStr != "" {
-				return fmt.Errorf("cannot set gateway or ip-range without subnet, specify --subnet manually")
-			}
-			if id > 255 {
-				return fmt.Errorf("cannot determine subnet for ID %d, specify --subnet manually", id)
-			}
-			subnetStr = fmt.Sprintf("10.4.%d.0/24", id)
-		}
-
-		labels := strutil.DedupeStrSlice(labels)
-		ipam, err := netutil.GenerateIPAM(ipamDriver, subnetStr, gatewayStr, ipRangeStr, strutil.ConvertKVStringsToMap(ipamOpts))
-		if err != nil {
-			return err
-		}
-		cniPlugins, err := e.GenerateCNIPlugins(driver, id, name, ipam, strutil.ConvertKVStringsToMap(opts))
-		if err != nil {
-			return err
-		}
-		net, err := e.GenerateNetworkConfig(labels, id, name, cniPlugins)
-		if err != nil {
-			return err
-		}
-		if err := e.WriteNetworkConfig(net); err != nil {
-			return err
-		}
-		fmt.Fprintf(cmd.OutOrStdout(), "%d\n", id)
-		return nil
 	}
 
-	return lockutil.WithDirLock(cniNetconfpath, fn)
+	e, err := netutil.NewCNIEnv(cniPath, cniNetconfpath)
+	if err != nil {
+		return err
+	}
+	createOpts := netutil.CreateOptions{
+		Name:        name,
+		Driver:      driver,
+		Options:     strutil.ConvertKVStringsToMap(opts),
+		IPAMDriver:  ipamDriver,
+		IPAMOptions: strutil.ConvertKVStringsToMap(ipamOpts),
+		Subnet:      subnetStr,
+		Gateway:     gatewayStr,
+		IPRange:     ipRangeStr,
+		Labels:      labels,
+	}
+	net, err := e.CreateNetwork(createOpts)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			return fmt.Errorf("network with name %s already exists", name)
+		}
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", *net.NerdctlID)
+	return err
 }

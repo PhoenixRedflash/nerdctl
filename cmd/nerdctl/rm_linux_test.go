@@ -16,4 +16,24 @@
 
 package main
 
-func removeBridgeNetworkInterface(name string) {}
+import (
+	"testing"
+
+	"github.com/containerd/nerdctl/pkg/testutil"
+)
+
+func TestRemoveContainer(t *testing.T) {
+	t.Parallel()
+	base := testutil.NewBase(t)
+	tID := testutil.Identifier(t)
+
+	// ignore error
+	base.Cmd("rm", tID, "-f").AssertOK()
+
+	base.Cmd("run", "-d", "--name", tID, testutil.CommonImage, "sleep", "infinity").AssertOK()
+	defer base.Cmd("rm", tID, "-f").AssertOK()
+	base.Cmd("rm", tID).AssertFail()
+
+	base.Cmd("kill", tID).AssertOK()
+	base.Cmd("rm", tID).AssertOK()
+}

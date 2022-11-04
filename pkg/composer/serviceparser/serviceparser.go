@@ -23,9 +23,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/compose-spec/compose-go/types"
-	compose "github.com/compose-spec/compose-go/types"
 	"github.com/containerd/containerd/contrib/nvidia"
 	"github.com/containerd/containerd/identifiers"
 	"github.com/containerd/nerdctl/pkg/reflectutil"
@@ -33,7 +33,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func warnUnknownFields(svc compose.ServiceConfig) {
+func warnUnknownFields(svc types.ServiceConfig) {
 	if unknown := reflectutil.UnknownNonEmptyFields(&svc,
 		"Name",
 		"Build",
@@ -51,6 +51,8 @@ func warnUnknownFields(svc compose.ServiceConfig) {
 		"Devices",
 		"Dockerfile", // handled by the loader (normalizer)
 		"DNS",
+		"DNSSearch",
+		"DNSOpts",
 		"Entrypoint",
 		"Environment",
 		"Extends", // handled by the loader
@@ -59,6 +61,7 @@ func warnUnknownFields(svc compose.ServiceConfig) {
 		"Image",
 		"Init",
 		"Labels",
+		"Logging",
 		"MemLimit",
 		"Networks",
 		"NetworkMode",
@@ -74,8 +77,12 @@ func warnUnknownFields(svc compose.ServiceConfig) {
 		"Secrets",
 		"Scale",
 		"SecurityOpt",
+		"StopGracePeriod",
+		"StopSignal",
 		"Sysctls",
+		"StdinOpen",
 		"Tmpfs",
+		"Tty",
 		"User",
 		"WorkingDir",
 		"Volumes",
@@ -159,8 +166,9 @@ func warnUnknownFields(svc compose.ServiceConfig) {
 }
 
 type Container struct {
-	Name    string   // e.g., "compose-wordpress_wordpress_1"
-	RunArgs []string // {"-d", "--pull=never", ...}
+	Name     string // e.g., "compose-wordpress_wordpress_1"
+	Detached bool
+	RunArgs  []string // {"--pull=never", ...}
 }
 
 type Build struct {
@@ -174,10 +182,10 @@ type Service struct {
 	PullMode   string
 	Containers []Container // length = replicas
 	Build      *Build
-	Unparsed   *compose.ServiceConfig
+	Unparsed   *types.ServiceConfig
 }
 
-func getReplicas(svc compose.ServiceConfig) (int, error) {
+func getReplicas(svc types.ServiceConfig) (int, error) {
 	replicas := 1
 
 	// No need to check svc.Scale, as it is automatically transformed to svc.Deploy.Replicas by compose-go
@@ -193,7 +201,7 @@ func getReplicas(svc compose.ServiceConfig) (int, error) {
 	return replicas, nil
 }
 
-func getCPULimit(svc compose.ServiceConfig) (string, error) {
+func getCPULimit(svc types.ServiceConfig) (string, error) {
 	var limit string
 	if svc.CPUS > 0 {
 		logrus.Warn("cpus is deprecated, use deploy.resources.limits.cpus")
@@ -210,7 +218,7 @@ func getCPULimit(svc compose.ServiceConfig) (string, error) {
 	return limit, nil
 }
 
-func getMemLimit(svc compose.ServiceConfig) (types.UnitBytes, error) {
+func getMemLimit(svc types.ServiceConfig) (types.UnitBytes, error) {
 	var limit types.UnitBytes
 	if svc.MemLimit > 0 {
 		logrus.Warn("mem_limit is deprecated, use deploy.resources.limits.memory")
@@ -227,7 +235,7 @@ func getMemLimit(svc compose.ServiceConfig) (types.UnitBytes, error) {
 	return limit, nil
 }
 
-func getGPUs(svc compose.ServiceConfig) (reqs []string, _ error) {
+func getGPUs(svc types.ServiceConfig) (reqs []string, _ error) {
 	// "gpu" and "nvidia" are also allowed capabilities (but not used as nvidia driver capabilities)
 	// https://github.com/moby/moby/blob/v20.10.7/daemon/nvidia_linux.go#L37
 	capset := map[string]struct{}{"gpu": {}, "nvidia": {}}
@@ -285,7 +293,7 @@ func getGPUs(svc compose.ServiceConfig) (reqs []string, _ error) {
 //
 // restart:                         {"no" (default), "always", "on-failure", "unless-stopped"} (https://github.com/compose-spec/compose-spec/blob/167f207d0a8967df87c5ed757dbb1a2bb6025a1e/spec.md#restart)
 // deploy.restart_policy.condition: {"none", "on-failure", "any" (default)}                    (https://github.com/compose-spec/compose-spec/blob/167f207d0a8967df87c5ed757dbb1a2bb6025a1e/deploy.md#restart_policy)
-func getRestart(svc compose.ServiceConfig) (string, error) {
+func getRestart(svc types.ServiceConfig) (string, error) {
 	var restartFlag string
 	switch svc.Restart {
 	case "":
@@ -327,7 +335,7 @@ type networkNamePair struct {
 }
 
 // getNetworks returns full network names, e.g., {"compose-wordpress_default"}, or {"host"}
-func getNetworks(project *compose.Project, svc compose.ServiceConfig) ([]networkNamePair, error) {
+func getNetworks(project *types.Project, svc types.ServiceConfig) ([]networkNamePair, error) {
 	var fullNames []networkNamePair // nolint: prealloc
 
 	if svc.Net != "" {
@@ -372,7 +380,7 @@ func getNetworks(project *compose.Project, svc compose.ServiceConfig) ([]network
 	return fullNames, nil
 }
 
-func Parse(project *compose.Project, svc compose.ServiceConfig) (*Service, error) {
+func Parse(project *types.Project, svc types.ServiceConfig) (*Service, error) {
 	warnUnknownFields(svc)
 
 	replicas, err := getReplicas(svc)
@@ -427,7 +435,7 @@ func Parse(project *compose.Project, svc compose.ServiceConfig) (*Service, error
 	return parsed, nil
 }
 
-func newContainer(project *compose.Project, parsed *Service, i int) (*Container, error) {
+func newContainer(project *types.Project, parsed *Service, i int) (*Container, error) {
 	svc := *parsed.Unparsed
 	var c Container
 	c.Name = fmt.Sprintf("%s_%s_%d", project.Name, svc.Name, i+1)
@@ -438,9 +446,9 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 		c.Name = svc.ContainerName
 	}
 
+	c.Detached = true
 	c.RunArgs = []string{
 		"--name=" + c.Name,
-		"-d",
 		"--pull=never", // because image will be ensured before running replicas with `nerdctl run`.
 	}
 
@@ -477,10 +485,11 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 	for _, v := range svc.DNS {
 		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--dns=%s", v))
 	}
-
-	if len(svc.Entrypoint) > 1 {
-		return nil, fmt.Errorf("service %s: specifying entrypoint with multiple strings (%v) is not supported yet",
-			svc.Name, svc.Entrypoint)
+	for _, v := range svc.DNSSearch {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--dns-search=%s", v))
+	}
+	for _, v := range svc.DNSOpts {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--dns-option=%s", v))
 	}
 
 	for _, v := range svc.Entrypoint {
@@ -494,8 +503,8 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 			c.RunArgs = append(c.RunArgs, fmt.Sprintf("-e=%s=%s", k, *v))
 		}
 	}
-	for _, v := range svc.ExtraHosts {
-		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--add-host=%s", v))
+	for k, v := range svc.ExtraHosts {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--add-host=%s:%s", k, v))
 	}
 
 	hostname := svc.Hostname
@@ -527,6 +536,17 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 			c.RunArgs = append(c.RunArgs, fmt.Sprintf("-l=%s", k))
 		} else {
 			c.RunArgs = append(c.RunArgs, fmt.Sprintf("-l=%s=%s", k, v))
+		}
+	}
+
+	if svc.Logging != nil {
+		if svc.Logging.Driver != "" {
+			c.RunArgs = append(c.RunArgs, fmt.Sprintf("--log-driver=%s", svc.Logging.Driver))
+		}
+		if svc.Logging.Options != nil {
+			for k, v := range svc.Logging.Options {
+				c.RunArgs = append(c.RunArgs, fmt.Sprintf("--log-opt=%s=%s", k, v))
+			}
 		}
 	}
 
@@ -581,6 +601,14 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 		c.RunArgs = append(c.RunArgs, "--read-only")
 	}
 
+	if svc.StopGracePeriod != nil {
+		timeout := time.Duration(*svc.StopGracePeriod)
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--stop-timeout=%d", int(timeout.Seconds())))
+	}
+	if svc.StopSignal != "" {
+		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--stop-signal=%s", svc.StopSignal))
+	}
+
 	if restart, err := getRestart(svc); err != nil {
 		return nil, err
 	} else if restart != "" {
@@ -597,6 +625,10 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 
 	for k, v := range svc.Sysctls {
 		c.RunArgs = append(c.RunArgs, fmt.Sprintf("--sysctl=%s=%s", k, v))
+	}
+
+	if svc.StdinOpen {
+		c.RunArgs = append(c.RunArgs, "--interactive")
 	}
 
 	if svc.User != "" {
@@ -631,6 +663,10 @@ func newContainer(project *compose.Project, parsed *Service, i int) (*Container,
 
 	for _, tmpfs := range svc.Tmpfs {
 		c.RunArgs = append(c.RunArgs, "--tmpfs="+tmpfs)
+	}
+
+	if svc.Tty {
+		c.RunArgs = append(c.RunArgs, "--tty")
 	}
 
 	if svc.WorkingDir != "" {

@@ -18,31 +18,35 @@
 # TODO: verify commit hash
 
 # Basic deps
-ARG CONTAINERD_VERSION=v1.6.4
-ARG RUNC_VERSION=v1.1.1
+ARG CONTAINERD_VERSION=v1.6.8
+ARG RUNC_VERSION=v1.1.4
 ARG CNI_PLUGINS_VERSION=v1.1.1
 
 # Extra deps: Build
-ARG BUILDKIT_VERSION=v0.10.2
+ARG BUILDKIT_VERSION=v0.10.5
 # Extra deps: Lazy-pulling
-ARG STARGZ_SNAPSHOTTER_VERSION=v0.11.4
+ARG STARGZ_SNAPSHOTTER_VERSION=v0.12.1
+# Extra deps: Nydus Lazy-pulling
+ARG NYDUS_VERSION=v2.1.0
 # Extra deps: Encryption
-ARG IMGCRYPT_VERSION=v1.1.4
+ARG IMGCRYPT_VERSION=v1.1.7
 # Extra deps: Rootless
 ARG ROOTLESSKIT_VERSION=v1.0.1
 ARG SLIRP4NETNS_VERSION=v1.2.0
 # Extra deps: bypass4netns
-ARG BYPASS4NETNS_VERSION=v0.2.2
+ARG BYPASS4NETNS_VERSION=v0.3.0
 # Extra deps: FUSE-OverlayFS
-ARG FUSE_OVERLAYFS_VERSION=v1.8.2
+ARG FUSE_OVERLAYFS_VERSION=v1.9
 ARG CONTAINERD_FUSE_OVERLAYFS_VERSION=v1.0.4
 # Extra deps: IPFS
-ARG IPFS_VERSION=v0.12.2
+ARG KUBO_VERSION=v0.16.0
 # Extra deps: Init
 ARG TINI_VERSION=v0.19.0
+# Extra deps: Debug
+ARG BUILDG_VERSION=v0.4.1
 
 # Test deps
-ARG GO_VERSION=1.18
+ARG GO_VERSION=1.19
 ARG UBUNTU_VERSION=22.04
 ARG CONTAINERIZED_SYSTEMD_VERSION=v0.1.1
 
@@ -189,26 +193,33 @@ RUN fname="containerd-fuse-overlayfs-${CONTAINERD_FUSE_OVERLAYFS_VERSION/v}-${TA
   tar xzf "${fname}" -C /out/bin && \
   rm -f "${fname}" && \
   echo "- containerd-fuse-overlayfs: ${CONTAINERD_FUSE_OVERLAYFS_VERSION}" >> /out/share/doc/nerdctl-full/README.md
-ARG IPFS_VERSION
-RUN fname="go-ipfs_${IPFS_VERSION}_${TARGETOS:-linux}-${TARGETARCH:-amd64}.tar.gz" && \
-  curl -o "${fname}" -fSL "https://github.com/ipfs/go-ipfs/releases/download/${IPFS_VERSION}/${fname}" && \
-  grep "${fname}" "/SHA256SUMS.d/go-ipfs-${IPFS_VERSION}" | sha256sum -c && \
+ARG KUBO_VERSION
+RUN fname="kubo_${KUBO_VERSION}_${TARGETOS:-linux}-${TARGETARCH:-amd64}.tar.gz" && \
+  curl -o "${fname}" -fSL "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${fname}" && \
+  grep "${fname}" "/SHA256SUMS.d/kubo-${KUBO_VERSION}" | sha256sum -c && \
   tmpout=$(mktemp -d) && \
-  tar -C ${tmpout} -xzf "${fname}" go-ipfs/ipfs && \
-  mv ${tmpout}/go-ipfs/ipfs /out/bin/ && \
-  echo "- IPFS: ${IPFS_VERSION}" >> /out/share/doc/nerdctl-full/README.md
+  tar -C ${tmpout} -xzf "${fname}" kubo/ipfs && \
+  mv ${tmpout}/kubo/ipfs /out/bin/ && \
+  echo "- Kubo (IPFS): ${KUBO_VERSION}" >> /out/share/doc/nerdctl-full/README.md
 ARG TINI_VERSION
 RUN fname="tini-static-${TARGETARCH:-amd64}" && \
   curl -o "${fname}" -fSL "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/${fname}" && \
   grep "${fname}" "/SHA256SUMS.d/tini-${TINI_VERSION}" | sha256sum -c && \
   cp -a "${fname}" /out/bin/tini && chmod +x /out/bin/tini && \
   echo "- Tini: ${TINI_VERSION}" >> /out/share/doc/nerdctl-full/README.md
+ARG BUILDG_VERSION
+RUN fname="buildg-${BUILDG_VERSION}-${TARGETOS:-linux}-${TARGETARCH:-amd64}.tar.gz" && \
+  curl -o "${fname}" -fSL "https://github.com/ktock/buildg/releases/download/${BUILDG_VERSION}/${fname}" && \
+  grep "${fname}" "/SHA256SUMS.d/buildg-${BUILDG_VERSION}" | sha256sum -c && \
+  tar xzf "${fname}" -C /out/bin && \
+  rm -f "${fname}" && \
+  echo "- buildg: ${BUILDG_VERSION}" >> /out/share/doc/nerdctl-full/README.md
 
 RUN echo "" >> /out/share/doc/nerdctl-full/README.md && \
   echo "## License" >> /out/share/doc/nerdctl-full/README.md && \
   echo "- bin/slirp4netns:    [GNU GENERAL PUBLIC LICENSE, Version 2](https://github.com/rootless-containers/slirp4netns/blob/${SLIRP4NETNS_VERSION}/COPYING)" >> /out/share/doc/nerdctl-full/README.md && \
   echo "- bin/fuse-overlayfs: [GNU GENERAL PUBLIC LICENSE, Version 3](https://github.com/containers/fuse-overlayfs/blob/${FUSE_OVERLAYFS_VERSION}/COPYING)" >> /out/share/doc/nerdctl-full/README.md && \
-  echo "- bin/ipfs: [Combination of MIT-only license and dual MIT/Apache-2.0 license](https://github.com/ipfs/go-ipfs/blob/${IPFS_VERSION}/LICENSE)" >> /out/share/doc/nerdctl-full/README.md && \
+  echo "- bin/ipfs: [Combination of MIT-only license and dual MIT/Apache-2.0 license](https://github.com/ipfs/kubo/blob/${KUBO_VERSION}/LICENSE)" >> /out/share/doc/nerdctl-full/README.md && \
   echo "- bin/{runc,bypass4netns,bypass4netnsd}: Apache License 2.0, statically linked with libseccomp ([LGPL 2.1](https://github.com/seccomp/libseccomp/blob/main/LICENSE), source code available at https://github.com/seccomp/libseccomp/)" >> /out/share/doc/nerdctl-full/README.md && \
   echo "- bin/tini: [MIT License](https://github.com/krallin/tini/blob/${TINI_VERSION}/LICENSE)" >> /out/share/doc/nerdctl-full/README.md && \
   echo "- Other files: [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)" >> /out/share/doc/nerdctl-full/README.md && \
@@ -224,23 +235,27 @@ FROM ubuntu:${UBUNTU_VERSION} AS base
 RUN apt-get update && \
   apt-get install -qq -y --no-install-recommends \
   apparmor \
+  bash-completion \
   ca-certificates curl \
   iproute2 iptables \
-  dbus systemd systemd-sysv \
+  dbus dbus-user-session systemd systemd-sysv \
   fuse3
 ARG CONTAINERIZED_SYSTEMD_VERSION
 RUN curl -L -o /docker-entrypoint.sh https://raw.githubusercontent.com/AkihiroSuda/containerized-systemd/${CONTAINERIZED_SYSTEMD_VERSION}/docker-entrypoint.sh && \
   chmod +x /docker-entrypoint.sh
 COPY --from=out-full / /usr/local/
 RUN perl -pi -e 's/multi-user.target/docker-entrypoint.target/g' /usr/local/lib/systemd/system/*.service && \
-  systemctl enable containerd buildkit stargz-snapshotter
+  systemctl enable containerd buildkit stargz-snapshotter && \
+  mkdir -p /etc/bash_completion.d && \
+  nerdctl completion bash >/etc/bash_completion.d/nerdctl
 COPY ./Dockerfile.d/etc_containerd_config.toml /etc/containerd/config.toml
+COPY ./Dockerfile.d/etc_buildkit_buildkitd.toml /etc/buildkit/buildkitd.toml
 VOLUME /var/lib/containerd
 VOLUME /var/lib/buildkit
 VOLUME /var/lib/containerd-stargz-grpc
 VOLUME /var/lib/nerdctl
 ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["bash"]
+CMD ["bash", "--login", "-i"]
 
 # convert GO_VERSION=1.16 to the latest release such as "go1.16.1"
 FROM golang:${GO_VERSION}-alpine AS goversion
@@ -272,6 +287,12 @@ RUN systemctl enable test-integration-ipfs-offline test-integration-buildkit-ner
     ipfs init && \
     ipfs config Addresses.API "/ip4/127.0.0.1/tcp/5888" && \
     ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/5889"
+# install nydus components
+ARG NYDUS_VERSION
+RUN curl -L -o nydus-static.tgz "https://github.com/dragonflyoss/image-service/releases/download/${NYDUS_VERSION}/nydus-static-${NYDUS_VERSION}-linux-${TARGETARCH}.tgz" && \
+    tar xzf nydus-static.tgz && \
+    mv nydus-static/nydus-image nydus-static/nydusd nydus-static/nydusify /usr/bin/ && \
+    rm nydus-static.tgz
 CMD ["go", "test", "-v", "-timeout=20m", "./cmd/nerdctl/...", "-args", "-test.kill-daemon"]
 
 FROM test-integration AS test-integration-rootless
@@ -281,7 +302,6 @@ FROM test-integration AS test-integration-rootless
 RUN apt-get update && \
   apt-get install -qq -y \
   uidmap \
-  dbus-user-session \
   openssh-server openssh-client
 # TODO: update containerized-systemd to enable sshd by default, or allow `systemctl wants <TARGET> sshd` here
 RUN ssh-keygen -q -t rsa -f /root/.ssh/id_rsa -N '' && \

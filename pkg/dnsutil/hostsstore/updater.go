@@ -49,7 +49,7 @@ type updater struct {
 	metaByIPStr   map[string]*Meta  // key: IP string
 	nwNameByIPStr map[string]string // key: IP string, value: key of Meta.Networks
 	metaByDir     map[string]*Meta  // key: "/var/lib/nerdctl/<ADDRHASH>/etchosts/<NS>/<ID>"
-	extraHosts    map[string]string
+	extraHosts    map[string]string // key: host value: IP string
 }
 
 // update updates the hostsD tree.
@@ -129,33 +129,43 @@ func (u *updater) phase2() error {
 			myNetworks[nwName] = struct{}{}
 		}
 
+		var buf bytes.Buffer
+		buf.WriteString(fmt.Sprintf("# %s\n", markerBegin))
+		buf.WriteString("127.0.0.1	localhost localhost.localdomain\n")
+		buf.WriteString("::1		localhost localhost.localdomain\n")
+
+		// keep extra hosts first
+		if u.id == myMeta.ID {
+			for host, ip := range u.extraHosts {
+				buf.WriteString(fmt.Sprintf("%-15s %s\n", ip, host))
+			}
+		}
+
 		// parse the hosts file, keep the original host record
 		hosts, err := ParseHosts(os.ReadFile(path))
 		if err != nil {
 			return err
 		}
-		// rewrite the import entries
-		hosts["127.0.0.1"] = []string{"localhost", "localhost.localdomain"}
-		hosts[":1"] = []string{"localhost", "localhost.localdomain"}
-
-		if u.id == myMeta.ID {
-			for ip, host := range u.extraHosts {
-				hosts[ip] = []string{host}
+		serviceHosts := make(map[string]string)
+		for ip, host := range hosts {
+			if ip == "127.0.0.1" || ip == "::1" {
+				continue
 			}
+			serviceHosts[strings.Join(host, " ")] = ip
 		}
 
 		// TODO: cut off entries for the containers in other networks
 		for ip, nwName := range u.nwNameByIPStr {
 			meta := u.metaByIPStr[ip]
 			if line := createLine(nwName, meta, myNetworks); len(line) != 0 {
-				hosts[ip] = line
+				serviceHosts[strings.Join(line, " ")] = ip
 			}
 		}
-		var buf bytes.Buffer
-		buf.WriteString(fmt.Sprintf("# %s\n", markerBegin))
-		for ip, host := range hosts {
-			buf.WriteString(fmt.Sprintf("%-15s    %s\n", ip, strings.Join(host, " ")))
+
+		for line, ip := range serviceHosts {
+			buf.WriteString(fmt.Sprintf("%-15s %s\n", ip, line))
 		}
+
 		buf.WriteString(fmt.Sprintf("# %s\n", markerEnd))
 		err = os.WriteFile(path, buf.Bytes(), 0644)
 		if err != nil {

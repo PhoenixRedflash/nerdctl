@@ -17,15 +17,22 @@
 package main
 
 import (
-	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
+	"fmt"
+	"testing"
+
+	"github.com/containerd/nerdctl/pkg/testutil"
 )
 
-func removeBridgeNetworkInterface(netIf string) {
-	link, err := netlink.LinkByName(netIf)
-	if err == nil {
-		if err = netlink.LinkDel(link); err != nil {
-			logrus.Warnf("Failed to remove network interface %s: %v", netIf, err)
-		}
-	}
+func TestVolumeRemove(t *testing.T) {
+	t.Parallel()
+	base := testutil.NewBase(t)
+	tID := testutil.Identifier(t)
+
+	base.Cmd("volume", "create", tID).AssertOK()
+	base.Cmd("run", "-v", fmt.Sprintf("%s:/volume", tID), "--name", tID, testutil.CommonImage).AssertOK()
+	defer base.Cmd("rm", "-f", tID).Run()
+
+	base.Cmd("volume", "rm", tID).AssertFail()
+	base.Cmd("rm", "-f", tID).AssertOK()
+	base.Cmd("volume", "rm", tID).AssertOK()
 }

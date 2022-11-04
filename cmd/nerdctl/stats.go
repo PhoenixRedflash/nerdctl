@@ -70,7 +70,7 @@ type stats struct {
 	cs []*statsutil.Stats
 }
 
-//add is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L26-L34
+// add is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L26-L34
 func (s *stats) add(cs *statsutil.Stats) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -81,7 +81,7 @@ func (s *stats) add(cs *statsutil.Stats) bool {
 	return false
 }
 
-//remove is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L36-L42
+// remove is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L36-L42
 func (s *stats) remove(id string) {
 	s.mu.Lock()
 	if i, exists := s.isKnownContainer(id); exists {
@@ -90,7 +90,7 @@ func (s *stats) remove(id string) {
 	s.mu.Unlock()
 }
 
-//isKnownContainer is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L44-L51
+// isKnownContainer is from https://github.com/docker/cli/blob/3fb4fb83dfb5db0c0753a8316f21aea54dab32c5/cli/command/container/stats_helpers.go#L44-L51
 func (s *stats) isKnownContainer(cid string) (int, bool) {
 	for i, c := range s.cs {
 		if c.Container == cid {
@@ -124,6 +124,19 @@ func statsAction(cmd *cobra.Command, args []string) error {
 	format, err := cmd.Flags().GetString("format")
 	if err != nil {
 		return err
+	}
+	var w = cmd.OutOrStdout()
+	var tmpl *template.Template
+	switch format {
+	case "", "table":
+		w = tabwriter.NewWriter(cmd.OutOrStdout(), 10, 1, 3, ' ', 0)
+	case "raw":
+		return errors.New("unsupported format: \"raw\"")
+	default:
+		tmpl, err = parseTemplate(format)
+		if err != nil {
+			return err
+		}
 	}
 
 	noTrunc, err := cmd.Flags().GetBool("no-trunc")
@@ -270,17 +283,6 @@ func statsAction(cmd *cobra.Command, args []string) error {
 		// make sure each container get at least one valid stat data
 		waitFirst.Wait()
 
-		var errs []string
-		cStats.mu.Lock()
-		for _, c := range cStats.cs {
-			if err := c.GetError(); err != nil {
-				errs = append(errs, err.Error())
-			}
-		}
-		cStats.mu.Unlock()
-		if len(errs) > 0 {
-			return errors.New(strings.Join(errs, "\n"))
-		}
 	}
 
 	cleanScreen := func() {
@@ -293,53 +295,52 @@ func statsAction(cmd *cobra.Command, args []string) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	// firstTick is for creating distant CPU readings.
+	// firstTick stats are not displayed.
+	var firstTick = true
 	for range ticker.C {
 		cleanScreen()
 		ccstats := []statsutil.StatsEntry{}
 		cStats.mu.Lock()
 		for _, c := range cStats.cs {
+			if err := c.GetError(); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "unable to get stat entry: %s\n", err)
+			}
 			ccstats = append(ccstats, c.GetStatistics())
 		}
 		cStats.mu.Unlock()
 
-		w := cmd.OutOrStdout()
-		var tmpl *template.Template
-
-		switch format {
-		case "", "table":
-			w = tabwriter.NewWriter(cmd.OutOrStdout(), 10, 1, 3, ' ', 0)
-			fmt.Fprintln(w, "CONTAINER ID\tNAME\tCPU %\tMEM USAGE / LIMIT\tMEM %\tNET I/O\tBLOCK I/O\tPIDS")
-		case "raw":
-			return errors.New("unsupported format: \"raw\"")
-		default:
-			tmpl, err = parseTemplate(format)
-			if err != nil {
-				break
+		if !firstTick {
+			// print header for every tick
+			if format == "" || format == "table" {
+				fmt.Fprintln(w, "CONTAINER ID\tNAME\tCPU %\tMEM USAGE / LIMIT\tMEM %\tNET I/O\tBLOCK I/O\tPIDS")
 			}
 		}
 
 		for _, c := range ccstats {
 			rc := statsutil.RenderEntry(&c, noTrunc)
-			if tmpl != nil {
-				var b bytes.Buffer
-				if err := tmpl.Execute(&b, rc); err != nil {
-					break
-				}
-				if _, err = fmt.Fprintf(cmd.OutOrStdout(), b.String()+"\n"); err != nil {
-					break
-				}
-			} else {
-				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					rc.ID,
-					rc.Name,
-					rc.CPUPerc,
-					rc.MemUsage,
-					rc.MemPerc,
-					rc.NetIO,
-					rc.BlockIO,
-					rc.PIDs,
-				); err != nil {
-					break
+			if !firstTick {
+				if tmpl != nil {
+					var b bytes.Buffer
+					if err := tmpl.Execute(&b, rc); err != nil {
+						break
+					}
+					if _, err = fmt.Fprintf(cmd.OutOrStdout(), b.String()+"\n"); err != nil {
+						break
+					}
+				} else {
+					if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						rc.ID,
+						rc.Name,
+						rc.CPUPerc,
+						rc.MemUsage,
+						rc.MemPerc,
+						rc.NetIO,
+						rc.BlockIO,
+						rc.PIDs,
+					); err != nil {
+						break
+					}
 				}
 			}
 		}
@@ -350,7 +351,7 @@ func statsAction(cmd *cobra.Command, args []string) error {
 		if len(cStats.cs) == 0 && !showAll {
 			break
 		}
-		if noStream {
+		if noStream && !firstTick {
 			break
 		}
 		select {
@@ -363,6 +364,7 @@ func statsAction(cmd *cobra.Command, args []string) error {
 		default:
 			// just skip
 		}
+		firstTick = false
 	}
 
 	return err
@@ -397,9 +399,8 @@ func collect(cmd *cobra.Command, s *statsutil.Stats, waitFirst *sync.WaitGroup, 
 	}
 
 	go func() {
-
-		previousStats := make(map[string]uint64)
-
+		previousStats := new(statsutil.ContainerStats)
+		firstSet := true
 		for {
 			//task is in the for loop to avoid nil task just after Container creation
 			task, err := container.Task(ctx, nil)
@@ -414,9 +415,6 @@ func collect(cmd *cobra.Command, s *statsutil.Stats, waitFirst *sync.WaitGroup, 
 				u <- err
 				continue
 			}
-
-			//sleep to create distant CPU readings
-			time.Sleep(500 * time.Millisecond)
 
 			metric, err := task.Metrics(ctx)
 			if err != nil {
@@ -435,7 +433,8 @@ func collect(cmd *cobra.Command, s *statsutil.Stats, waitFirst *sync.WaitGroup, 
 				continue
 			}
 
-			statsEntry, err := renderStatsEntry(previousStats, anydata, int(task.Pid()), netNS.Interfaces)
+			// when (firstSet == true), we only set container stats without rendering stat entry
+			statsEntry, err := setContainerStatsAndRenderStatsEntry(previousStats, firstSet, anydata, int(task.Pid()), netNS.Interfaces)
 			if err != nil {
 				u <- err
 				continue
@@ -443,8 +442,14 @@ func collect(cmd *cobra.Command, s *statsutil.Stats, waitFirst *sync.WaitGroup, 
 			statsEntry.Name = clabels[labels.Name]
 			statsEntry.ID = container.ID()
 
-			s.SetStatistics(statsEntry)
+			if firstSet {
+				firstSet = false
+			} else {
+				s.SetStatistics(statsEntry)
+			}
 			u <- nil
+			//sleep to create distant CPU readings
+			time.Sleep(500 * time.Millisecond)
 		}
 	}()
 	for {

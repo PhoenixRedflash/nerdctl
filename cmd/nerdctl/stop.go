@@ -21,13 +21,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/pkg/labels"
 
+	"github.com/moby/sys/signal"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 )
 
 func newStopCommand() *cobra.Command {
@@ -40,22 +43,20 @@ func newStopCommand() *cobra.Command {
 		SilenceUsage:      true,
 		SilenceErrors:     true,
 	}
-	stopCommand.Flags().StringP("time", "t", "10", "Seconds to wait for stop before killing it")
+	stopCommand.Flags().IntP("time", "t", 10, "Seconds to wait for stop before killing it")
 	return stopCommand
 }
 
 func stopAction(cmd *cobra.Command, args []string) error {
 	// Time to wait after sending a SIGTERM and before sending a SIGKILL.
-	// Default is 10 seconds.
-	timeoutStr, err := cmd.Flags().GetString("time")
-	if err != nil {
-		return err
-	}
-	timeoutStr = timeoutStr + "s"
-
-	timeout, err := time.ParseDuration(timeoutStr)
-	if err != nil {
-		return err
+	var timeout *time.Duration
+	if cmd.Flags().Changed("time") {
+		timeValue, err := cmd.Flags().GetInt("time")
+		if err != nil {
+			return err
+		}
+		t := time.Duration(timeValue) * time.Second
+		timeout = &t
 	}
 
 	client, ctx, cancel, err := newClient(cmd)
@@ -67,9 +68,12 @@ func stopAction(cmd *cobra.Command, args []string) error {
 	walker := &containerwalker.ContainerWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
 			if err := stopContainer(ctx, found.Container, timeout); err != nil {
 				if errdefs.IsNotFound(err) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Error response from daemon: No such container: %s\n", found.Req)
+					fmt.Fprintf(cmd.ErrOrStderr(), "No such container: %s\n", found.Req)
 					return nil
 				}
 				return err
@@ -89,9 +93,27 @@ func stopAction(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func stopContainer(ctx context.Context, container containerd.Container, timeout time.Duration) error {
+func stopContainer(ctx context.Context, container containerd.Container, timeout *time.Duration) error {
 	if err := updateContainerStoppedLabel(ctx, container, true); err != nil {
 		return err
+	}
+
+	l, err := container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+
+	if timeout == nil {
+		t, ok := l[labels.StopTimout]
+		if !ok {
+			// Default is 10 seconds.
+			t = "10"
+		}
+		td, err := time.ParseDuration(t + "s")
+		if err != nil {
+			return err
+		}
+		timeout = &td
 	}
 
 	task, err := container.Task(ctx, cio.Load)
@@ -120,13 +142,19 @@ func stopContainer(ctx context.Context, container containerd.Container, timeout 
 		return err
 	}
 
-	if timeout > 0 {
-		signal, err := containerd.ParseSignal("SIGTERM")
+	if *timeout > 0 {
+		sig, err := signal.ParseSignal("SIGTERM")
 		if err != nil {
 			return err
 		}
+		if stopSignal, ok := l[containerd.StopSignalLabel]; ok {
+			sig, err = signal.ParseSignal(stopSignal)
+			if err != nil {
+				return err
+			}
+		}
 
-		if err := task.Kill(ctx, signal); err != nil {
+		if err := task.Kill(ctx, sig); err != nil {
 			return err
 		}
 
@@ -140,7 +168,7 @@ func stopContainer(ctx context.Context, container containerd.Container, timeout 
 			}
 		}
 
-		sigtermCtx, sigtermCtxCancel := context.WithTimeout(ctx, timeout)
+		sigtermCtx, sigtermCtxCancel := context.WithTimeout(ctx, *timeout)
 		defer sigtermCtxCancel()
 
 		err = waitContainerStop(sigtermCtx, exitCh, container.ID())
@@ -153,12 +181,12 @@ func stopContainer(ctx context.Context, container containerd.Container, timeout 
 		}
 	}
 
-	signal, err := containerd.ParseSignal("SIGKILL")
+	sig, err := signal.ParseSignal("SIGKILL")
 	if err != nil {
 		return err
 	}
 
-	if err := task.Kill(ctx, signal); err != nil {
+	if err := task.Kill(ctx, sig); err != nil {
 		return err
 	}
 

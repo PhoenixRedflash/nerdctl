@@ -86,6 +86,9 @@ services:
     restart: always
     ports:
       - 8080:80
+    extra_hosts:
+      test.com: 172.19.1.1
+      test2.com: 172.19.1.2
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: exampleuser
@@ -94,6 +97,17 @@ services:
     volumes:
       - wordpress:/var/www/html
     pids_limit: 100
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    dns_search: example.com
+    dns_opt:
+      - no-tld-query
+    logging:
+      driver: json-file
+      options:
+        max-size: "5K"
+        max-file: "2"
 
   db:
     image: mariadb:10.5
@@ -105,6 +119,8 @@ services:
       MYSQL_RANDOM_ROOT_PASSWORD: '1'
     volumes:
       - db:/var/lib/mysql
+    stop_grace_period: 1m30s
+    stop_signal: SIGUSR1
 
 volumes:
   wordpress:
@@ -139,6 +155,15 @@ volumes:
 	assert.Assert(t, in(wp1.RunArgs, "--pids-limit=100"))
 	assert.Assert(t, in(wp1.RunArgs, "--ulimit=nproc=500"))
 	assert.Assert(t, in(wp1.RunArgs, "--ulimit=nofile=20000:20000"))
+	assert.Assert(t, in(wp1.RunArgs, "--dns=8.8.8.8"))
+	assert.Assert(t, in(wp1.RunArgs, "--dns=8.8.4.4"))
+	assert.Assert(t, in(wp1.RunArgs, "--dns-search=example.com"))
+	assert.Assert(t, in(wp1.RunArgs, "--dns-option=no-tld-query"))
+	assert.Assert(t, in(wp1.RunArgs, "--log-driver=json-file"))
+	assert.Assert(t, in(wp1.RunArgs, "--log-opt=max-size=5K"))
+	assert.Assert(t, in(wp1.RunArgs, "--log-opt=max-file=2"))
+	assert.Assert(t, in(wp1.RunArgs, "--add-host=test.com:172.19.1.1"))
+	assert.Assert(t, in(wp1.RunArgs, "--add-host=test2.com:172.19.1.2"))
 
 	dbSvc, err := project.GetService("db")
 	assert.NilError(t, err)
@@ -152,6 +177,8 @@ volumes:
 	assert.Assert(t, db1.Name == fmt.Sprintf("%s_db_1", project.Name))
 	assert.Assert(t, in(db1.RunArgs, "--hostname=db"))
 	assert.Assert(t, in(db1.RunArgs, fmt.Sprintf("-v=%s_db:/var/lib/mysql", project.Name)))
+	assert.Assert(t, in(db1.RunArgs, "--stop-signal=SIGUSR1"))
+	assert.Assert(t, in(db1.RunArgs, "--stop-timeout=90"))
 }
 
 func TestParseDeprecated(t *testing.T) {

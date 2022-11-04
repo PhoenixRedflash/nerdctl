@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,9 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/pkg/progress"
 	"github.com/containerd/nerdctl/pkg/formatter"
 	"github.com/containerd/nerdctl/pkg/labels"
 	"github.com/containerd/nerdctl/pkg/labels/k8slabels"
@@ -53,11 +56,14 @@ func newPsCommand() *cobra.Command {
 	psCommand.Flags().BoolP("latest", "l", false, "Show the latest created container (includes all states)")
 	psCommand.Flags().Bool("no-trunc", false, "Don't truncate output")
 	psCommand.Flags().BoolP("quiet", "q", false, "Only display container IDs")
+	psCommand.Flags().BoolP("size", "s", false, "Display total file sizes")
+
 	// Alias "-f" is reserved for "--filter"
 	psCommand.Flags().String("format", "", "Format the output using the given Go template, e.g, '{{json .}}', 'wide'")
 	psCommand.RegisterFlagCompletionFunc("format", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return []string{"json", "table", "wide"}, cobra.ShellCompDirectiveNoFileComp
 	})
+	psCommand.Flags().StringSliceP("filter", "f", nil, "Filter matches containers based on given conditions")
 	return psCommand
 }
 
@@ -86,6 +92,15 @@ func psAction(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	filters, err := cmd.Flags().GetStringSlice("filter")
+	if err != nil {
+		return err
+	}
+	filterCtx, err := foldContainerFilters(ctx, containers, filters)
+	if err != nil {
+		return err
+	}
+	containers = filterCtx.MatchesFilters(ctx)
 	if lastN > 0 {
 		all = true
 		sort.Slice(containers, func(i, j int) bool {
@@ -97,7 +112,7 @@ func psAction(cmd *cobra.Command, args []string) error {
 			containers = containers[:lastN]
 		}
 	}
-	return printContainers(ctx, cmd, containers, all)
+	return printContainers(ctx, client, cmd, containers, all)
 }
 
 type containerPrintable struct {
@@ -110,10 +125,12 @@ type containerPrintable struct {
 	Ports     string
 	Status    string
 	Runtime   string // nerdctl extension
-	// TODO: "Labels", "LocalVolumes", "Mounts", "Networks", "RunningFor", "Size", "State"
+	Size      string
+	Labels    string
+	// TODO: "LocalVolumes", "Mounts", "Networks", "RunningFor", "State"
 }
 
-func printContainers(ctx context.Context, cmd *cobra.Command, containers []containerd.Container, all bool) error {
+func printContainers(ctx context.Context, client *containerd.Client, cmd *cobra.Command, containers []containerd.Container, all bool) error {
 	noTrunc, err := cmd.Flags().GetBool("no-trunc")
 	if err != nil {
 		return err
@@ -125,6 +142,7 @@ func printContainers(ctx context.Context, cmd *cobra.Command, containers []conta
 	if err != nil {
 		return err
 	}
+
 	var w io.Writer
 	w = os.Stdout
 	var tmpl *template.Template
@@ -132,18 +150,31 @@ func printContainers(ctx context.Context, cmd *cobra.Command, containers []conta
 	if err != nil {
 		return err
 	}
+
+	size := false
+	if !quiet {
+		size, err = cmd.Flags().GetBool("size")
+		if err != nil {
+			return err
+		}
+	}
+
 	switch format {
 	case "", "table":
 		w = tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
 		if !quiet {
-			fmt.Fprintln(w, "CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES")
+			printHeader := "CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES"
+			if size {
+				printHeader += "\tSIZE"
+			}
+			fmt.Fprintln(w, printHeader)
 		}
 	case "raw":
 		return errors.New("unsupported format: \"raw\"")
 	case "wide":
 		w = tabwriter.NewWriter(os.Stdout, 4, 8, 4, ' ', 0)
 		if !quiet {
-			fmt.Fprintln(w, "CONTAINER ID\tIMAGE\tPLATFORM\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES\tRUNTIME")
+			fmt.Fprintln(w, "CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES\tRUNTIME\tPLATFORM\tSIZE")
 			wide = true
 		}
 	default:
@@ -197,6 +228,15 @@ func printContainers(ctx context.Context, cmd *cobra.Command, containers []conta
 			Ports:     formatter.FormatPorts(info.Labels),
 			Status:    cStatus,
 			Runtime:   info.Runtime.Name,
+			Labels:    formatter.FormatLabels(info.Labels),
+		}
+
+		if size || wide {
+			containerSize, err := getContainerSize(ctx, client, c, info)
+			if err != nil {
+				return err
+			}
+			p.Size = containerSize
 		}
 
 		if tmpl != nil {
@@ -212,34 +252,30 @@ func printContainers(ctx context.Context, cmd *cobra.Command, containers []conta
 				return err
 			}
 		} else {
+			format := "%s\t%s\t%s\t%s\t%s\t%s\t%s"
+			args := []interface{}{
+				p.ID,
+				p.Image,
+				p.Command,
+				formatter.TimeSinceInHuman(info.CreatedAt),
+				p.Status,
+				p.Ports,
+				p.Names,
+			}
 			if wide {
-				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					p.ID,
-					p.Image,
-					p.Platform,
-					p.Command,
-					formatter.TimeSinceInHuman(info.CreatedAt),
-					p.Status,
-					p.Ports,
-					p.Names,
-					p.Runtime,
-				); err != nil {
-					return err
-				}
+				format += "\t%s\t%s\t%s\n"
+				args = append(args, p.Runtime, p.Platform, p.Size)
+			} else if size {
+				format += "\t%s\n"
+				args = append(args, p.Size)
 			} else {
-				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
-					p.ID,
-					p.Image,
-					p.Command,
-					formatter.TimeSinceInHuman(info.CreatedAt),
-					p.Status,
-					p.Ports,
-					p.Names,
-				); err != nil {
-					return err
-				}
+				format += "\n"
+			}
+			if _, err := fmt.Fprintf(w, format, args...); err != nil {
+				return err
 			}
 		}
+
 	}
 	if f, ok := w.(Flusher); ok {
 		return f.Flush()
@@ -264,4 +300,84 @@ func getPrintableContainerName(containerLabels map[string]string) string {
 		}
 	}
 	return ""
+}
+
+type containerVolume struct {
+	Type        string
+	Name        string
+	Source      string
+	Destination string
+	Mode        string
+	RW          bool
+	Propagation string
+}
+
+func getContainerVolumes(containerLabels map[string]string) []*containerVolume {
+	var vols []*containerVolume
+	volLabels := []string{labels.AnonymousVolumes, labels.Mounts}
+	for _, volLabel := range volLabels {
+		names, ok := containerLabels[volLabel]
+		if !ok {
+			continue
+		}
+		var (
+			volumes []*containerVolume
+			err     error
+		)
+		if volLabel == labels.Mounts {
+			err = json.Unmarshal([]byte(names), &volumes)
+		}
+		if volLabel == labels.AnonymousVolumes {
+			var anonymous []string
+			err = json.Unmarshal([]byte(names), &anonymous)
+			for _, anony := range anonymous {
+				volumes = append(volumes, &containerVolume{Name: anony})
+			}
+
+		}
+		if err != nil {
+			logrus.Warn(err)
+		}
+		vols = append(vols, volumes...)
+	}
+	return vols
+}
+
+func getContainerNetworks(containerLables map[string]string) []string {
+	var networks []string
+	if names, ok := containerLables[labels.Networks]; ok {
+		if err := json.Unmarshal([]byte(names), &networks); err != nil {
+			logrus.Warn(err)
+		}
+	}
+	return networks
+}
+
+func getContainerSize(ctx context.Context, client *containerd.Client, c containerd.Container, info containers.Container) (string, error) {
+	// get container snapshot size
+	snapshotKey := info.SnapshotKey
+	var containerSize int64
+
+	if snapshotKey != "" {
+		usage, err := client.SnapshotService(info.Snapshotter).Usage(ctx, snapshotKey)
+		if err != nil {
+			return "", err
+		}
+		containerSize = usage.Size
+	}
+
+	// get the image interface
+	image, err := c.Image(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	sn := client.SnapshotService(info.Snapshotter)
+
+	imageSize, err := unpackedImageSize(ctx, sn, image)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%s (virtual %s)", progress.Bytes(containerSize).String(), progress.Bytes(imageSize).String()), nil
 }

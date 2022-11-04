@@ -23,6 +23,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
@@ -30,17 +31,15 @@ import (
 	"github.com/containerd/containerd/platforms"
 	refdocker "github.com/containerd/containerd/reference/docker"
 	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/imgcrypt"
 	"github.com/containerd/imgcrypt/images/encryption"
 	"github.com/containerd/nerdctl/pkg/errutil"
 	"github.com/containerd/nerdctl/pkg/idutil/imagewalker"
 	"github.com/containerd/nerdctl/pkg/imgutil/dockerconfigresolver"
 	"github.com/containerd/nerdctl/pkg/imgutil/pull"
-	"github.com/containerd/stargz-snapshotter/fs/source"
+	"github.com/containerd/nerdctl/pkg/referenceutil"
 	"github.com/docker/docker/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
 	"github.com/sirupsen/logrus"
 )
 
@@ -51,6 +50,11 @@ type EnsuredImage struct {
 	Snapshotter string
 	Remote      bool // true for stargz or overlaybd
 }
+
+var (
+	FilterBeforeType = "before"
+	FilterSinceType  = "since"
+)
 
 // PullMode is either one of "always", "missing", "never"
 type PullMode = string
@@ -76,7 +80,7 @@ func GetExistingImage(ctx context.Context, client *containerd.Client, snapshotte
 				Image:       image,
 				ImageConfig: *imgConfig,
 				Snapshotter: snapshotter,
-				Remote:      isStargz(snapshotter) || isOverlaybd(snapshotter),
+				Remote:      getSnapshotterOpts(snapshotter).isRemote(),
 			}
 			if unpacked, err := image.IsUnpacked(ctx, snapshotter); err == nil && !unpacked {
 				if err := image.Unpack(ctx, snapshotter); err != nil {
@@ -101,7 +105,7 @@ func GetExistingImage(ctx context.Context, client *containerd.Client, snapshotte
 
 // EnsureImage ensures the image.
 //
-// When insecure is set, skips verifying certs, and also falls back to HTTP when the registry does not speak HTTPS
+// # When insecure is set, skips verifying certs, and also falls back to HTTP when the registry does not speak HTTPS
 //
 // FIXME: this func has too many args
 func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr io.Writer, snapshotter, rawRef string, mode PullMode, insecure bool, hostsDirs []string, ocispecPlatforms []ocispec.Platform, unpack *bool, quiet bool) (*EnsuredImage, error) {
@@ -221,7 +225,7 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 		unpackB = len(ocispecPlatforms) == 1
 	}
 
-	var sgz, overlaybd bool
+	snOpt := getSnapshotterOpts(snapshotter)
 	if unpackB {
 		logrus.Debugf("The image will be unpacked for platform %q, snapshotter %q.", ocispecPlatforms[0], snapshotter)
 		imgcryptPayload := imgcrypt.Payload{}
@@ -230,28 +234,8 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 			containerd.WithPullUnpack,
 			containerd.WithUnpackOpts([]containerd.UnpackOpt{imgcryptUnpackOpt}))
 
-		sgz = isStargz(snapshotter)
-		if sgz {
-			// TODO: support "skip-content-verify"
-			config.RemoteOpts = append(
-				config.RemoteOpts,
-				containerd.WithImageHandlerWrapper(source.AppendDefaultLabelsHandlerWrapper(ref, 10*1024*1024)),
-			)
-		}
-		overlaybd = isOverlaybd(snapshotter)
-		if overlaybd {
-			snlabel := map[string]string{"containerd.io/snapshot/image-ref": ref}
-			logrus.Debugf("append remote opts: %s", snlabel)
-
-			config.RemoteOpts = append(
-				config.RemoteOpts,
-				containerd.WithPullSnapshotter(snapshotter, snapshots.WithLabels(snlabel)),
-			)
-		} else {
-			config.RemoteOpts = append(
-				config.RemoteOpts,
-				containerd.WithPullSnapshotter(snapshotter))
-		}
+		// different remote snapshotters will update pull.Config separately
+		snOpt.apply(config, ref)
 	} else {
 		logrus.Debugf("The image will not be unpacked. Platforms=%v.", ocispecPlatforms)
 	}
@@ -268,24 +252,10 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 		Image:       containerdImage,
 		ImageConfig: *imgConfig,
 		Snapshotter: snapshotter,
-		Remote:      (sgz || overlaybd),
+		Remote:      snOpt.isRemote(),
 	}
 	return res, nil
 
-}
-
-func isStargz(sn string) bool {
-	if !strings.Contains(sn, "stargz") {
-		return false
-	}
-	if sn != "stargz" {
-		logrus.Debugf("assuming %q to be a stargz-compatible snapshotter", sn)
-	}
-	return true
-}
-
-func isOverlaybd(sn string) bool {
-	return sn == "overlaybd"
 }
 
 func getImageConfig(ctx context.Context, image containerd.Image) (*ocispec.ImageConfig, error) {
@@ -409,4 +379,66 @@ func ParseRepoTag(imgName string) (string, string) {
 	repository := refdocker.FamiliarName(ref)
 
 	return repository, tag
+}
+
+func ParseFilters(filters []string) ([]string, []string, error) {
+	var beforeFilters []string
+	var sinceFilters []string
+	for _, filter := range filters {
+		tempFilterToken := strings.Split(filter, "=")
+		switch len(tempFilterToken) {
+		case 1:
+			return nil, nil, fmt.Errorf("invalid filter %q", filter)
+		case 2:
+			if tempFilterToken[0] == FilterBeforeType {
+				canonicalRef, err := referenceutil.ParseAny(tempFilterToken[1])
+				if err != nil {
+					return nil, nil, err
+				}
+				beforeFilters = append(beforeFilters, fmt.Sprintf("name==%s", canonicalRef.String()))
+				beforeFilters = append(beforeFilters, fmt.Sprintf("name==%s", tempFilterToken[1]))
+			} else if tempFilterToken[0] == FilterSinceType {
+				canonicalRef, err := referenceutil.ParseAny(tempFilterToken[1])
+				if err != nil {
+					return nil, nil, err
+				}
+				sinceFilters = append(sinceFilters, fmt.Sprintf("name==%s", canonicalRef.String()))
+				sinceFilters = append(sinceFilters, fmt.Sprintf("name==%s", tempFilterToken[1]))
+			} else {
+				return nil, nil, fmt.Errorf("invalid filter %q", filter)
+			}
+		default:
+			return nil, nil, fmt.Errorf("invalid filter %q", filter)
+		}
+	}
+	return beforeFilters, sinceFilters, nil
+}
+
+func FilterImages(labelImages []images.Image, beforeImages []images.Image, sinceImages []images.Image) []images.Image {
+
+	var filteredImages []images.Image
+	maxTime := time.Now()
+	minTime := time.Date(1970, time.Month(1), 1, 0, 0, 0, 0, time.UTC)
+	if len(beforeImages) > 0 {
+		maxTime = beforeImages[0].CreatedAt
+		for _, value := range beforeImages {
+			if value.CreatedAt.After(maxTime) {
+				maxTime = value.CreatedAt
+			}
+		}
+	}
+	if len(sinceImages) > 0 {
+		minTime = sinceImages[0].CreatedAt
+		for _, value := range sinceImages {
+			if value.CreatedAt.Before(minTime) {
+				minTime = value.CreatedAt
+			}
+		}
+	}
+	for _, image := range labelImages {
+		if image.CreatedAt.After(minTime) && image.CreatedAt.Before(maxTime) {
+			filteredImages = append(filteredImages, image)
+		}
+	}
+	return filteredImages
 }

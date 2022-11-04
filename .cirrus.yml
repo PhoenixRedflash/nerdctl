@@ -1,40 +1,5 @@
-# GitHub Actions does not support cgroup v2, so we use Cirrus for cgroup v2.
-linux_cgroup2_task:
-  name: "Linux/cgroup2"
-  timeout_in: 60m
-  compute_engine_instance:
-    image_project: ubuntu-os-cloud
-    image: family/ubuntu-2110
-    # CPU limit: `16 / NTASK`: see https://cirrus-ci.org/faq/#are-there-any-limits
-    cpu: 4
-    # Memory limit: `4GB * NCPU`
-    memory: 16G
-    disk: 100
-  env:
-    DEBIAN_FRONTEND: noninteractive
-    DOCKER_BUILDKIT: 1
-  # Remove snap loopback devices (conflicts with our loopback devices in TestRunDevice)
-  remove_snapd_script:
-    - systemctl disable --now snapd.service snapd.socket
-    - apt-get purge -y snapd
-    - losetup -Dv
-    - losetup -lv
-  install_docker_script:
-    - apt-get update
-    - apt-get install -y docker.io
-    - docker info
-  rootful_build_script:
-    - docker build -t test-integration --target test-integration .
-  rootful_test_script:
-    - docker run -t --rm --privileged test-integration
-  rootless_build_script:
-    - docker build -t test-integration-rootless --target test-integration-rootless .
-  rootless_test_script:
-    # WORKAROUND_CIRRUS: Workaround for https://github.com/containerd/nerdctl/issues/622
-    - docker run -t --rm --privileged -e WORKAROUND_CIRRUS=1 test-integration-rootless
-
 freebsd_task:
-  name: "FreeBSD (Unit tests only)"
+  name: FreeBSD
   timeout_in: 20m
   compute_engine_instance:
     image_project: freebsd-org-cloud-dev
@@ -42,12 +7,16 @@ freebsd_task:
     platform: freebsd
     cpu: 2
     memory: 4G
+  env:
+     NERDCTL_RUN_ARGS: --net none dougrabson/freebsd-minimal:13.1 echo "Nerdctl is up and running."
   install_script:
-    - pkg install -y go
+    - pkg install -y go containerd runj
   test_script:
+    - daemon -o containerd.out containerd
     - go test -v ./pkg/...
+    - cd cmd/nerdctl
+    - sudo go run . run $NERDCTL_RUN_ARGS | grep running
 # TODO: run `go test -v ./cmd/...`
-# FIXME: `nerdctl run` is broken on FreeBSD: https://github.com/containerd/nerdctl/issues/868
 
 windows_task:
   name: "Windows"
@@ -61,7 +30,7 @@ windows_task:
   matrix:
     - name: "Windows/containerd-1.6"
       env:
-        ctrdVersion: 1.6.4
+        ctrdVersion: 1.6.8
   env:
     CGO_ENABLED: 0
   build_script:
